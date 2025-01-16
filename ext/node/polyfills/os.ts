@@ -1,4 +1,4 @@
-// Copyright 2018-2023 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -23,14 +23,22 @@
 // TODO(petamoriken): enable prefer-primordials for node polyfills
 // deno-lint-ignore-file prefer-primordials
 
-const core = globalThis.__bootstrap.core;
+import {
+  op_cpus,
+  op_homedir,
+  op_node_os_get_priority,
+  op_node_os_set_priority,
+  op_node_os_user_info,
+} from "ext:core/ops";
+
 import { validateIntegerRange } from "ext:deno_node/_utils.ts";
 import process from "node:process";
-import { isWindows, osType } from "ext:deno_node/_util/os.ts";
-import { ERR_OS_NO_HOMEDIR } from "ext:deno_node/internal/errors.ts";
+import { isWindows } from "ext:deno_node/_util/os.ts";
 import { os } from "ext:deno_node/internal_binding/constants.ts";
-import { osUptime } from "ext:runtime/30_os.js";
+import { osUptime } from "ext:deno_os/30_os.js";
 import { Buffer } from "ext:deno_node/internal/buffer.mjs";
+import { primordials } from "ext:core/mod.js";
+const { StringPrototypeEndsWith, StringPrototypeSlice } = primordials;
 
 export const constants = os;
 
@@ -103,6 +111,9 @@ export function arch(): string {
 }
 
 // deno-lint-ignore no-explicit-any
+(availableParallelism as any)[Symbol.toPrimitive] = (): number =>
+  availableParallelism();
+// deno-lint-ignore no-explicit-any
 (arch as any)[Symbol.toPrimitive] = (): string => process.arch;
 // deno-lint-ignore no-explicit-any
 (endianness as any)[Symbol.toPrimitive] = (): string => endianness();
@@ -124,21 +135,13 @@ export function arch(): string {
 (type as any)[Symbol.toPrimitive] = (): string => type();
 // deno-lint-ignore no-explicit-any
 (uptime as any)[Symbol.toPrimitive] = (): number => uptime();
+// deno-lint-ignore no-explicit-any
+(machine as any)[Symbol.toPrimitive] = (): string => machine();
+// deno-lint-ignore no-explicit-any
+(tmpdir as any)[Symbol.toPrimitive] = (): string | null => tmpdir();
 
 export function cpus(): CPUCoreInfo[] {
-  return Array.from(Array(navigator.hardwareConcurrency)).map(() => {
-    return {
-      model: "",
-      speed: 0,
-      times: {
-        user: 0,
-        nice: 0,
-        sys: 0,
-        idle: 0,
-        irq: 0,
-      },
-    };
-  });
+  return op_cpus();
 }
 
 /**
@@ -156,31 +159,25 @@ export function endianness(): "BE" | "LE" {
 
 /** Return free memory amount */
 export function freemem(): number {
-  return Deno.systemMemoryInfo().free;
+  if (Deno.build.os === "linux" || Deno.build.os == "android") {
+    // On linux, use 'available' memory
+    // https://github.com/libuv/libuv/blob/a5c01d4de3695e9d9da34cfd643b5ff0ba582ea7/src/unix/linux.c#L2064
+    return Deno.systemMemoryInfo().available;
+  } else {
+    // Use 'free' memory on other platforms
+    return Deno.systemMemoryInfo().free;
+  }
 }
 
 /** Not yet implemented */
 export function getPriority(pid = 0): number {
   validateIntegerRange(pid, "pid");
-  return core.ops.op_node_os_get_priority(pid);
+  return op_node_os_get_priority(pid);
 }
 
 /** Returns the string path of the current user's home directory. */
 export function homedir(): string | null {
-  // Note: Node/libuv calls getpwuid() / GetUserProfileDirectory() when the
-  // environment variable isn't set but that's the (very uncommon) fallback
-  // path. IMO, it's okay to punt on that for now.
-  switch (osType) {
-    case "windows":
-      return Deno.env.get("USERPROFILE") || null;
-    case "linux":
-    case "darwin":
-    case "freebsd":
-    case "openbsd":
-      return Deno.env.get("HOME") || null;
-    default:
-      throw Error("unreachable");
-  }
+  return op_homedir();
 }
 
 /** Returns the host name of the operating system as a string. */
@@ -247,6 +244,15 @@ export function version(): string {
   return Deno.osRelease();
 }
 
+/** Returns the machine type as a string */
+export function machine(): string {
+  if (Deno.build.arch == "aarch64") {
+    return "arm64";
+  }
+
+  return Deno.build.arch;
+}
+
 /** Not yet implemented */
 export function setPriority(pid: number, priority?: number) {
   /* The node API has the 'pid' as the first parameter and as optional.
@@ -258,33 +264,34 @@ export function setPriority(pid: number, priority?: number) {
   validateIntegerRange(pid, "pid");
   validateIntegerRange(priority, "priority", -20, 19);
 
-  core.ops.op_node_os_set_priority(pid, priority);
+  op_node_os_set_priority(pid, priority);
 }
 
 /** Returns the operating system's default directory for temporary files as a string. */
 export function tmpdir(): string | null {
   /* This follows the node js implementation, but has a few
      differences:
-     * On windows, if none of the environment variables are defined,
-       we return null.
-     * On unix we use a plain Deno.env.get, instead of safeGetenv,
+     * We use a plain Deno.env.get, instead of safeGetenv,
        which special cases setuid binaries.
-     * Node removes a single trailing / or \, we remove all.
   */
   if (isWindows) {
-    const temp = Deno.env.get("TEMP") || Deno.env.get("TMP");
-    if (temp) {
-      return temp.replace(/(?<!:)[/\\]*$/, "");
+    let temp = Deno.env.get("TEMP") || Deno.env.get("TMP") ||
+      (Deno.env.get("SystemRoot") || Deno.env.get("windir")) + "\\temp";
+    if (
+      temp.length > 1 && StringPrototypeEndsWith(temp, "\\") &&
+      !StringPrototypeEndsWith(temp, ":\\")
+    ) {
+      temp = StringPrototypeSlice(temp, 0, -1);
     }
-    const base = Deno.env.get("SYSTEMROOT") || Deno.env.get("WINDIR");
-    if (base) {
-      return base + "\\temp";
-    }
-    return null;
+
+    return temp;
   } else { // !isWindows
-    const temp = Deno.env.get("TMPDIR") || Deno.env.get("TMP") ||
+    let temp = Deno.env.get("TMPDIR") || Deno.env.get("TMP") ||
       Deno.env.get("TEMP") || "/tmp";
-    return temp.replace(/(?<!^)\/*$/, "");
+    if (temp.length > 1 && StringPrototypeEndsWith(temp, "/")) {
+      temp = StringPrototypeSlice(temp, 0, -1);
+    }
+    return temp;
   }
 }
 
@@ -299,6 +306,7 @@ export function type(): string {
     case "windows":
       return "Windows_NT";
     case "linux":
+    case "android":
       return "Linux";
     case "darwin":
       return "Darwin";
@@ -307,7 +315,7 @@ export function type(): string {
     case "openbsd":
       return "OpenBSD";
     default:
-      throw Error("unreachable");
+      throw new Error("unreachable");
   }
 }
 
@@ -316,7 +324,6 @@ export function uptime(): number {
   return osUptime();
 }
 
-/** Not yet implemented */
 export function userInfo(
   options: UserInfoOptions = { encoding: "utf-8" },
 ): UserInfo {
@@ -327,20 +334,10 @@ export function userInfo(
     uid = -1;
     gid = -1;
   }
-
-  // TODO(@crowlKats): figure out how to do this correctly:
-  //  The value of homedir returned by os.userInfo() is provided by the operating system.
-  //  This differs from the result of os.homedir(), which queries environment
-  //  variables for the home directory before falling back to the operating system response.
-  let _homedir = homedir();
-  if (!_homedir) {
-    throw new ERR_OS_NO_HOMEDIR();
-  }
-  let shell = isWindows ? (Deno.env.get("SHELL") || null) : null;
-  let username = core.ops.op_node_os_username();
+  let { username, homedir, shell } = op_node_os_user_info(uid);
 
   if (options?.encoding === "buffer") {
-    _homedir = _homedir ? Buffer.from(_homedir) : _homedir;
+    homedir = homedir ? Buffer.from(homedir) : homedir;
     shell = shell ? Buffer.from(shell) : shell;
     username = Buffer.from(username);
   }
@@ -348,16 +345,22 @@ export function userInfo(
   return {
     uid,
     gid,
-    homedir: _homedir,
+    homedir,
     shell,
     username,
   };
+}
+
+/* Returns an estimate of the default amount of parallelism a program should use. */
+export function availableParallelism(): number {
+  return navigator.hardwareConcurrency;
 }
 
 export const EOL = isWindows ? "\r\n" : "\n";
 export const devNull = isWindows ? "\\\\.\\nul" : "/dev/null";
 
 export default {
+  availableParallelism,
   arch,
   cpus,
   endianness,
@@ -367,6 +370,7 @@ export default {
   hostname,
   loadavg,
   networkInterfaces,
+  machine,
   platform,
   release,
   setPriority,

@@ -1,15 +1,9 @@
-// Copyright 2018-2023 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 
-use deno_core::error::AnyError;
-use deno_core::futures::channel::mpsc;
-use deno_core::OpState;
-
-use std::cell::RefCell;
 use std::mem::size_of;
 use std::os::raw::c_char;
 use std::os::raw::c_short;
-use std::path::Path;
-use std::rc::Rc;
+use std::path::PathBuf;
 
 mod call;
 mod callback;
@@ -23,12 +17,19 @@ mod turbocall;
 use call::op_ffi_call_nonblocking;
 use call::op_ffi_call_ptr;
 use call::op_ffi_call_ptr_nonblocking;
+pub use call::CallError;
 use callback::op_ffi_unsafe_callback_close;
 use callback::op_ffi_unsafe_callback_create;
 use callback::op_ffi_unsafe_callback_ref;
+pub use callback::CallbackError;
+use deno_permissions::PermissionCheckError;
 use dlfcn::op_ffi_load;
+pub use dlfcn::DlfcnError;
 use dlfcn::ForeignFunction;
+pub use ir::IRError;
 use r#static::op_ffi_get_static;
+pub use r#static::StaticError;
+pub use repr::ReprError;
 use repr::*;
 use symbol::NativeType;
 use symbol::Symbol;
@@ -42,36 +43,32 @@ const _: () = {
   assert!(size_of::<*const ()>() == 8);
 };
 
-pub(crate) const MAX_SAFE_INTEGER: isize = 9007199254740991;
-pub(crate) const MIN_SAFE_INTEGER: isize = -9007199254740991;
-
-pub struct Unstable(pub bool);
-
-fn check_unstable(state: &OpState, api_name: &str) {
-  let unstable = state.borrow::<Unstable>();
-
-  if !unstable.0 {
-    eprintln!(
-      "Unstable API '{api_name}'. The --unstable flag must be provided."
-    );
-    std::process::exit(70);
-  }
-}
-
-pub fn check_unstable2(state: &Rc<RefCell<OpState>>, api_name: &str) {
-  let state = state.borrow();
-  check_unstable(&state, api_name)
-}
+pub const UNSTABLE_FEATURE_NAME: &str = "ffi";
 
 pub trait FfiPermissions {
-  fn check_partial(&mut self, path: Option<&Path>) -> Result<(), AnyError>;
+  fn check_partial_no_path(&mut self) -> Result<(), PermissionCheckError>;
+  #[must_use = "the resolved return value to mitigate time-of-check to time-of-use issues"]
+  fn check_partial_with_path(
+    &mut self,
+    path: &str,
+  ) -> Result<PathBuf, PermissionCheckError>;
 }
 
-pub(crate) type PendingFfiAsyncWork = Box<dyn FnOnce()>;
+impl FfiPermissions for deno_permissions::PermissionsContainer {
+  #[inline(always)]
+  fn check_partial_no_path(&mut self) -> Result<(), PermissionCheckError> {
+    deno_permissions::PermissionsContainer::check_ffi_partial_no_path(self)
+  }
 
-pub(crate) struct FfiState {
-  pub(crate) async_work_sender: mpsc::UnboundedSender<PendingFfiAsyncWork>,
-  pub(crate) async_work_receiver: mpsc::UnboundedReceiver<PendingFfiAsyncWork>,
+  #[inline(always)]
+  fn check_partial_with_path(
+    &mut self,
+    path: &str,
+  ) -> Result<PathBuf, PermissionCheckError> {
+    deno_permissions::PermissionsContainer::check_ffi_partial_with_path(
+      self, path,
+    )
+  }
 }
 
 deno_core::extension!(deno_ffi,
@@ -86,6 +83,7 @@ deno_core::extension!(deno_ffi,
     op_ffi_ptr_create<P>,
     op_ffi_ptr_equals<P>,
     op_ffi_ptr_of<P>,
+    op_ffi_ptr_of_exact<P>,
     op_ffi_ptr_offset<P>,
     op_ffi_ptr_value<P>,
     op_ffi_get_buf<P>,
@@ -108,42 +106,4 @@ deno_core::extension!(deno_ffi,
     op_ffi_unsafe_callback_ref,
   ],
   esm = [ "00_ffi.js" ],
-  options = {
-    unstable: bool,
-  },
-  state = |state, options| {
-    // Stolen from deno_webgpu, is there a better option?
-    state.put(Unstable(options.unstable));
-  },
-  event_loop_middleware = event_loop_middleware,
 );
-
-fn event_loop_middleware(
-  op_state_rc: Rc<RefCell<OpState>>,
-  _cx: &mut std::task::Context,
-) -> bool {
-  // FFI callbacks coming in from other threads will call in and get queued.
-  let mut maybe_scheduling = false;
-
-  let mut op_state = op_state_rc.borrow_mut();
-  if let Some(ffi_state) = op_state.try_borrow_mut::<FfiState>() {
-    // TODO(mmastrac): This should be a SmallVec to avoid allocations in most cases
-    let mut work_items = Vec::with_capacity(1);
-
-    while let Ok(Some(async_work_fut)) =
-      ffi_state.async_work_receiver.try_next()
-    {
-      // Move received items to a temporary vector so that we can drop the `op_state` borrow before we do the work.
-      work_items.push(async_work_fut);
-      maybe_scheduling = true;
-    }
-
-    // Drop the op_state and ffi_state borrows
-    drop(op_state);
-    for async_work_fut in work_items.into_iter() {
-      async_work_fut();
-    }
-  }
-
-  maybe_scheduling
-}

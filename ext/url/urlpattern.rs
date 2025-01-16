@@ -1,43 +1,40 @@
-// Copyright 2018-2023 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 
-use deno_core::error::type_error;
-use deno_core::error::AnyError;
-use deno_core::op;
-
+use deno_core::op2;
 use urlpattern::quirks;
 use urlpattern::quirks::MatchInput;
 use urlpattern::quirks::StringOrInit;
 use urlpattern::quirks::UrlPattern;
 
-#[op]
-pub fn op_urlpattern_parse(
-  input: StringOrInit,
-  base_url: Option<String>,
-) -> Result<UrlPattern, AnyError> {
-  let init = urlpattern::quirks::process_construct_pattern_input(
-    input,
-    base_url.as_deref(),
-  )
-  .map_err(|e| type_error(e.to_string()))?;
+deno_error::js_error_wrapper!(urlpattern::Error, UrlPatternError, "TypeError");
 
-  let pattern = urlpattern::quirks::parse_pattern(init)
-    .map_err(|e| type_error(e.to_string()))?;
+#[op2]
+#[serde]
+pub fn op_urlpattern_parse(
+  #[serde] input: StringOrInit,
+  #[string] base_url: Option<String>,
+  #[serde] options: urlpattern::UrlPatternOptions,
+) -> Result<UrlPattern, UrlPatternError> {
+  let init =
+    quirks::process_construct_pattern_input(input, base_url.as_deref())?;
+
+  let pattern = quirks::parse_pattern(init, options)?;
 
   Ok(pattern)
 }
 
-#[op]
+#[op2]
+#[serde]
 pub fn op_urlpattern_process_match_input(
-  input: StringOrInit,
-  base_url: Option<String>,
-) -> Result<Option<(MatchInput, quirks::Inputs)>, AnyError> {
-  let res = urlpattern::quirks::process_match_input(input, base_url.as_deref())
-    .map_err(|e| type_error(e.to_string()))?;
+  #[serde] input: StringOrInit,
+  #[string] base_url: Option<String>,
+) -> Result<Option<(MatchInput, quirks::Inputs)>, UrlPatternError> {
+  let res = quirks::process_match_input(input, base_url.as_deref())?;
 
   let (input, inputs) = match res {
     Some((input, inputs)) => (input, inputs),
     None => return Ok(None),
   };
 
-  Ok(urlpattern::quirks::parse_match_input(input).map(|input| (input, inputs)))
+  Ok(quirks::parse_match_input(input).map(|input| (input, inputs)))
 }

@@ -1,97 +1,231 @@
-// Copyright 2018-2023 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 
 mod interface;
 mod ops;
 mod std_fs;
 pub mod sync;
 
+use std::borrow::Cow;
+use std::path::Path;
+use std::path::PathBuf;
+
+use deno_io::fs::FsError;
+use deno_permissions::PermissionCheckError;
+
+pub use crate::interface::AccessCheckCb;
+pub use crate::interface::AccessCheckFn;
 pub use crate::interface::FileSystem;
 pub use crate::interface::FileSystemRc;
 pub use crate::interface::FsDirEntry;
 pub use crate::interface::FsFileType;
 pub use crate::interface::OpenOptions;
+pub use crate::ops::FsOpsError;
+pub use crate::ops::FsOpsErrorKind;
+pub use crate::ops::OperationError;
+use crate::ops::*;
 pub use crate::std_fs::RealFs;
 pub use crate::sync::MaybeSend;
 pub use crate::sync::MaybeSync;
 
-use crate::ops::*;
-
-use deno_core::error::AnyError;
-use deno_core::OpState;
-use std::cell::RefCell;
-use std::path::Path;
-use std::rc::Rc;
-
 pub trait FsPermissions {
-  fn check_read(&mut self, path: &Path, api_name: &str)
-    -> Result<(), AnyError>;
-  fn check_read_all(&mut self, api_name: &str) -> Result<(), AnyError>;
+  fn check_open<'a>(
+    &mut self,
+    resolved: bool,
+    read: bool,
+    write: bool,
+    path: &'a Path,
+    api_name: &str,
+  ) -> Result<std::borrow::Cow<'a, Path>, FsError>;
+  #[must_use = "the resolved return value to mitigate time-of-check to time-of-use issues"]
+  fn check_read(
+    &mut self,
+    path: &str,
+    api_name: &str,
+  ) -> Result<PathBuf, PermissionCheckError>;
+  #[must_use = "the resolved return value to mitigate time-of-check to time-of-use issues"]
+  fn check_read_path<'a>(
+    &mut self,
+    path: &'a Path,
+    api_name: &str,
+  ) -> Result<Cow<'a, Path>, PermissionCheckError>;
+  fn check_read_all(
+    &mut self,
+    api_name: &str,
+  ) -> Result<(), PermissionCheckError>;
   fn check_read_blind(
     &mut self,
     p: &Path,
     display: &str,
     api_name: &str,
-  ) -> Result<(), AnyError>;
+  ) -> Result<(), PermissionCheckError>;
+  #[must_use = "the resolved return value to mitigate time-of-check to time-of-use issues"]
   fn check_write(
     &mut self,
-    path: &Path,
+    path: &str,
     api_name: &str,
-  ) -> Result<(), AnyError>;
+  ) -> Result<PathBuf, PermissionCheckError>;
+  #[must_use = "the resolved return value to mitigate time-of-check to time-of-use issues"]
+  fn check_write_path<'a>(
+    &mut self,
+    path: &'a Path,
+    api_name: &str,
+  ) -> Result<Cow<'a, Path>, PermissionCheckError>;
+  #[must_use = "the resolved return value to mitigate time-of-check to time-of-use issues"]
   fn check_write_partial(
     &mut self,
-    path: &Path,
+    path: &str,
     api_name: &str,
-  ) -> Result<(), AnyError>;
-  fn check_write_all(&mut self, api_name: &str) -> Result<(), AnyError>;
+  ) -> Result<PathBuf, PermissionCheckError>;
+  fn check_write_all(
+    &mut self,
+    api_name: &str,
+  ) -> Result<(), PermissionCheckError>;
   fn check_write_blind(
     &mut self,
     p: &Path,
     display: &str,
     api_name: &str,
-  ) -> Result<(), AnyError>;
+  ) -> Result<(), PermissionCheckError>;
 
-  fn check(
+  fn check<'a>(
     &mut self,
+    resolved: bool,
     open_options: &OpenOptions,
-    path: &Path,
+    path: &'a Path,
     api_name: &str,
-  ) -> Result<(), AnyError> {
-    if open_options.read {
-      self.check_read(path, api_name)?;
-    }
-    if open_options.write || open_options.append {
-      self.check_write(path, api_name)?;
-    }
-    Ok(())
+  ) -> Result<std::borrow::Cow<'a, Path>, FsError> {
+    self.check_open(
+      resolved,
+      open_options.read,
+      open_options.write || open_options.append,
+      path,
+      api_name,
+    )
   }
 }
 
-struct UnstableChecker {
-  pub unstable: bool,
-}
-
-impl UnstableChecker {
-  // NOTE(bartlomieju): keep in sync with `cli/program_state.rs`
-  pub fn check_unstable(&self, api_name: &str) {
-    if !self.unstable {
-      eprintln!(
-        "Unstable API '{api_name}'. The --unstable flag must be provided."
-      );
-      std::process::exit(70);
+impl FsPermissions for deno_permissions::PermissionsContainer {
+  fn check_open<'a>(
+    &mut self,
+    resolved: bool,
+    read: bool,
+    write: bool,
+    path: &'a Path,
+    api_name: &str,
+  ) -> Result<Cow<'a, Path>, FsError> {
+    if resolved {
+      self
+        .check_special_file(path, api_name)
+        .map_err(FsError::NotCapable)?;
+      return Ok(Cow::Borrowed(path));
     }
+
+    // If somehow read or write aren't specified, use read
+    let read = read || !write;
+    let mut path: Cow<'a, Path> = Cow::Borrowed(path);
+    if read {
+      let resolved_path = FsPermissions::check_read_path(self, &path, api_name)
+        .map_err(|_| FsError::NotCapable("read"))?;
+      if let Cow::Owned(resolved_path) = resolved_path {
+        path = Cow::Owned(resolved_path);
+      }
+    }
+    if write {
+      let resolved_path =
+        FsPermissions::check_write_path(self, &path, api_name)
+          .map_err(|_| FsError::NotCapable("write"))?;
+      if let Cow::Owned(resolved_path) = resolved_path {
+        path = Cow::Owned(resolved_path);
+      }
+    }
+    Ok(path)
+  }
+
+  fn check_read(
+    &mut self,
+    path: &str,
+    api_name: &str,
+  ) -> Result<PathBuf, PermissionCheckError> {
+    deno_permissions::PermissionsContainer::check_read(self, path, api_name)
+  }
+
+  fn check_read_path<'a>(
+    &mut self,
+    path: &'a Path,
+    api_name: &str,
+  ) -> Result<Cow<'a, Path>, PermissionCheckError> {
+    deno_permissions::PermissionsContainer::check_read_path(
+      self,
+      path,
+      Some(api_name),
+    )
+  }
+  fn check_read_blind(
+    &mut self,
+    path: &Path,
+    display: &str,
+    api_name: &str,
+  ) -> Result<(), PermissionCheckError> {
+    deno_permissions::PermissionsContainer::check_read_blind(
+      self, path, display, api_name,
+    )
+  }
+
+  fn check_write(
+    &mut self,
+    path: &str,
+    api_name: &str,
+  ) -> Result<PathBuf, PermissionCheckError> {
+    deno_permissions::PermissionsContainer::check_write(self, path, api_name)
+  }
+
+  fn check_write_path<'a>(
+    &mut self,
+    path: &'a Path,
+    api_name: &str,
+  ) -> Result<Cow<'a, Path>, PermissionCheckError> {
+    deno_permissions::PermissionsContainer::check_write_path(
+      self, path, api_name,
+    )
+  }
+
+  fn check_write_partial(
+    &mut self,
+    path: &str,
+    api_name: &str,
+  ) -> Result<PathBuf, PermissionCheckError> {
+    deno_permissions::PermissionsContainer::check_write_partial(
+      self, path, api_name,
+    )
+  }
+
+  fn check_write_blind(
+    &mut self,
+    p: &Path,
+    display: &str,
+    api_name: &str,
+  ) -> Result<(), PermissionCheckError> {
+    deno_permissions::PermissionsContainer::check_write_blind(
+      self, p, display, api_name,
+    )
+  }
+
+  fn check_read_all(
+    &mut self,
+    api_name: &str,
+  ) -> Result<(), PermissionCheckError> {
+    deno_permissions::PermissionsContainer::check_read_all(self, api_name)
+  }
+
+  fn check_write_all(
+    &mut self,
+    api_name: &str,
+  ) -> Result<(), PermissionCheckError> {
+    deno_permissions::PermissionsContainer::check_write_all(self, api_name)
   }
 }
 
-/// Helper for checking unstable features. Used for sync ops.
-pub(crate) fn check_unstable(state: &OpState, api_name: &str) {
-  state.borrow::<UnstableChecker>().check_unstable(api_name)
-}
-
-/// Helper for checking unstable features. Used for async ops.
-pub(crate) fn check_unstable2(state: &Rc<RefCell<OpState>>, api_name: &str) {
-  let state = state.borrow();
-  state.borrow::<UnstableChecker>().check_unstable(api_name)
-}
+pub const UNSTABLE_FEATURE_NAME: &str = "fs";
 
 deno_core::extension!(deno_fs,
   deps = [ deno_web ],
@@ -146,29 +280,27 @@ deno_core::extension!(deno_fs,
 
     op_fs_seek_sync,
     op_fs_seek_async,
-    op_fs_fdatasync_sync,
-    op_fs_fdatasync_async,
-    op_fs_fsync_sync,
-    op_fs_fsync_async,
-    op_fs_fstat_sync,
-    op_fs_fstat_async,
-    op_fs_flock_sync,
+    op_fs_file_sync_data_sync,
+    op_fs_file_sync_data_async,
+    op_fs_file_sync_sync,
+    op_fs_file_sync_async,
+    op_fs_file_stat_sync,
+    op_fs_file_stat_async,
     op_fs_flock_async,
-    op_fs_funlock_sync,
+    op_fs_flock_sync,
     op_fs_funlock_async,
+    op_fs_funlock_sync,
     op_fs_ftruncate_sync,
-    op_fs_ftruncate_async,
+    op_fs_file_truncate_async,
     op_fs_futime_sync,
     op_fs_futime_async,
 
   ],
   esm = [ "30_fs.js" ],
   options = {
-    unstable: bool,
     fs: FileSystemRc,
   },
   state = |state, options| {
-    state.put(UnstableChecker { unstable: options.unstable });
     state.put(options.fs);
   },
 );

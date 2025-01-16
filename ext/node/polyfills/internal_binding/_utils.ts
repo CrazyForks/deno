@@ -1,11 +1,11 @@
-// Copyright 2018-2023 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 
 // TODO(petamoriken): enable prefer-primordials for node polyfills
 // deno-lint-ignore-file prefer-primordials
 
 import {
   forgivingBase64Decode,
-  forgivingBase64UrlEncode,
+  forgivingBase64UrlDecode,
 } from "ext:deno_web/00_infra.js";
 
 export function asciiToBytes(str: string) {
@@ -18,9 +18,13 @@ export function asciiToBytes(str: string) {
 }
 
 export function base64ToBytes(str: string) {
-  str = base64clean(str);
-  str = str.replaceAll("-", "+").replaceAll("_", "/");
-  return forgivingBase64Decode(str);
+  try {
+    return forgivingBase64Decode(str);
+  } catch {
+    str = base64clean(str);
+    str = str.replaceAll("-", "+").replaceAll("_", "/");
+    return forgivingBase64Decode(str);
+  }
 }
 
 const INVALID_BASE64_RE = /[^+/0-9A-Za-z-_]/g;
@@ -51,7 +55,7 @@ function base64clean(str: string) {
 export function base64UrlToBytes(str: string) {
   str = base64clean(str);
   str = str.replaceAll("+", "-").replaceAll("/", "_");
-  return forgivingBase64UrlEncode(str);
+  return forgivingBase64UrlDecode(str);
 }
 
 export function hexToBytes(str: string) {

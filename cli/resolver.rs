@@ -1,280 +1,282 @@
-// Copyright 2018-2023 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 
-use deno_core::anyhow::anyhow;
-use deno_core::anyhow::bail;
-use deno_core::error::AnyError;
-use deno_core::futures::future;
-use deno_core::futures::future::LocalBoxFuture;
-use deno_core::futures::FutureExt;
-use deno_core::ModuleSpecifier;
-use deno_graph::source::NpmPackageReqResolution;
-use deno_graph::source::NpmResolver;
-use deno_graph::source::Resolver;
-use deno_graph::source::UnknownBuiltInNodeModuleError;
-use deno_graph::source::DEFAULT_JSX_IMPORT_SOURCE_MODULE;
-use deno_npm::registry::NpmRegistryApi;
-use deno_runtime::deno_node::is_builtin_node_module;
-use deno_semver::package::PackageReq;
-use import_map::ImportMap;
-use std::path::PathBuf;
+use std::borrow::Cow;
 use std::sync::Arc;
 
-use crate::args::package_json::PackageJsonDeps;
-use crate::args::JsxImportSourceConfig;
-use crate::args::PackageJsonDepsProvider;
-use crate::npm::CliNpmRegistryApi;
-use crate::npm::NpmResolution;
-use crate::npm::PackageJsonDepsInstaller;
-use crate::util::sync::AtomicFlag;
+use async_trait::async_trait;
+use dashmap::DashSet;
+use deno_ast::MediaType;
+use deno_config::workspace::MappedResolutionDiagnostic;
+use deno_config::workspace::MappedResolutionError;
+use deno_core::anyhow::Context;
+use deno_core::error::AnyError;
+use deno_core::url::Url;
+use deno_core::ModuleSourceCode;
+use deno_core::ModuleSpecifier;
+use deno_error::JsErrorBox;
+use deno_graph::source::ResolveError;
+use deno_graph::source::UnknownBuiltInNodeModuleError;
+use deno_graph::NpmLoadError;
+use deno_graph::NpmResolvePkgReqsResult;
+use deno_npm::resolution::NpmResolutionError;
+use deno_resolver::npm::DenoInNpmPackageChecker;
+use deno_resolver::sloppy_imports::SloppyImportsCachedFs;
+use deno_resolver::sloppy_imports::SloppyImportsResolver;
+use deno_runtime::colors;
+use deno_runtime::deno_fs;
+use deno_runtime::deno_node::is_builtin_node_module;
+use deno_runtime::deno_node::RealIsBuiltInNodeModuleChecker;
+use deno_semver::package::PackageReq;
+use node_resolver::NodeResolutionKind;
+use node_resolver::ResolutionMode;
+use thiserror::Error;
 
-/// Result of checking if a specifier is mapped via
-/// an import map or package.json.
-pub enum MappedResolution {
-  None,
-  PackageJson(ModuleSpecifier),
-  ImportMap(ModuleSpecifier),
+use crate::args::NpmCachingStrategy;
+use crate::args::DENO_DISABLE_PEDANTIC_NODE_WARNINGS;
+use crate::node::CliNodeCodeTranslator;
+use crate::npm::installer::NpmInstaller;
+use crate::npm::installer::PackageCaching;
+use crate::npm::CliNpmResolver;
+use crate::sys::CliSys;
+use crate::util::sync::AtomicFlag;
+use crate::util::text_encoding::from_utf8_lossy_cow;
+
+pub type CliCjsTracker =
+  deno_resolver::cjs::CjsTracker<DenoInNpmPackageChecker, CliSys>;
+pub type CliIsCjsResolver =
+  deno_resolver::cjs::IsCjsResolver<DenoInNpmPackageChecker, CliSys>;
+pub type CliSloppyImportsCachedFs = SloppyImportsCachedFs<CliSys>;
+pub type CliSloppyImportsResolver =
+  SloppyImportsResolver<CliSloppyImportsCachedFs>;
+pub type CliDenoResolver = deno_resolver::DenoResolver<
+  DenoInNpmPackageChecker,
+  RealIsBuiltInNodeModuleChecker,
+  CliNpmResolver,
+  CliSloppyImportsCachedFs,
+  CliSys,
+>;
+pub type CliNpmReqResolver = deno_resolver::npm::NpmReqResolver<
+  DenoInNpmPackageChecker,
+  RealIsBuiltInNodeModuleChecker,
+  CliNpmResolver,
+  CliSys,
+>;
+
+pub struct ModuleCodeStringSource {
+  pub code: ModuleSourceCode,
+  pub found_url: ModuleSpecifier,
+  pub media_type: MediaType,
 }
 
-impl MappedResolution {
-  pub fn into_specifier(self) -> Option<ModuleSpecifier> {
-    match self {
-      MappedResolution::None => Option::None,
-      MappedResolution::PackageJson(specifier) => Some(specifier),
-      MappedResolution::ImportMap(specifier) => Some(specifier),
+#[derive(Debug, Error, deno_error::JsError)]
+#[class(type)]
+#[error("{media_type} files are not supported in npm packages: {specifier}")]
+pub struct NotSupportedKindInNpmError {
+  pub media_type: MediaType,
+  pub specifier: Url,
+}
+
+// todo(dsherret): move to module_loader.rs (it seems to be here due to use in standalone)
+#[derive(Clone)]
+pub struct NpmModuleLoader {
+  cjs_tracker: Arc<CliCjsTracker>,
+  fs: Arc<dyn deno_fs::FileSystem>,
+  node_code_translator: Arc<CliNodeCodeTranslator>,
+}
+
+impl NpmModuleLoader {
+  pub fn new(
+    cjs_tracker: Arc<CliCjsTracker>,
+    fs: Arc<dyn deno_fs::FileSystem>,
+    node_code_translator: Arc<CliNodeCodeTranslator>,
+  ) -> Self {
+    Self {
+      cjs_tracker,
+      node_code_translator,
+      fs,
     }
+  }
+
+  pub async fn load(
+    &self,
+    specifier: &ModuleSpecifier,
+    maybe_referrer: Option<&ModuleSpecifier>,
+  ) -> Result<ModuleCodeStringSource, AnyError> {
+    let file_path = specifier.to_file_path().unwrap();
+    let code = self
+      .fs
+      .read_file_async(file_path.clone(), None)
+      .await
+      .map_err(AnyError::from)
+      .with_context(|| {
+        if file_path.is_dir() {
+          // directory imports are not allowed when importing from an
+          // ES module, so provide the user with a helpful error message
+          let dir_path = file_path;
+          let mut msg = "Directory import ".to_string();
+          msg.push_str(&dir_path.to_string_lossy());
+          if let Some(referrer) = &maybe_referrer {
+            msg.push_str(" is not supported resolving import from ");
+            msg.push_str(referrer.as_str());
+            let entrypoint_name = ["index.mjs", "index.js", "index.cjs"]
+              .iter()
+              .find(|e| dir_path.join(e).is_file());
+            if let Some(entrypoint_name) = entrypoint_name {
+              msg.push_str("\nDid you mean to import ");
+              msg.push_str(entrypoint_name);
+              msg.push_str(" within the directory?");
+            }
+          }
+          msg
+        } else {
+          let mut msg = "Unable to load ".to_string();
+          msg.push_str(&file_path.to_string_lossy());
+          if let Some(referrer) = &maybe_referrer {
+            msg.push_str(" imported from ");
+            msg.push_str(referrer.as_str());
+          }
+          msg
+        }
+      })?;
+
+    let media_type = MediaType::from_specifier(specifier);
+    if media_type.is_emittable() {
+      return Err(AnyError::from(NotSupportedKindInNpmError {
+        media_type,
+        specifier: specifier.clone(),
+      }));
+    }
+
+    let code = if self.cjs_tracker.is_maybe_cjs(specifier, media_type)? {
+      // translate cjs to esm if it's cjs and inject node globals
+      let code = from_utf8_lossy_cow(code);
+      ModuleSourceCode::String(
+        self
+          .node_code_translator
+          .translate_cjs_to_esm(specifier, Some(code))
+          .await?
+          .into_owned()
+          .into(),
+      )
+    } else {
+      // esm and json code is untouched
+      ModuleSourceCode::Bytes(match code {
+        Cow::Owned(bytes) => bytes.into_boxed_slice().into(),
+        Cow::Borrowed(bytes) => bytes.into(),
+      })
+    };
+
+    Ok(ModuleCodeStringSource {
+      code,
+      found_url: specifier.clone(),
+      media_type: MediaType::from_specifier(specifier),
+    })
   }
 }
 
-/// Resolver for specifiers that could be mapped via an
-/// import map or package.json.
+#[derive(Debug, Default)]
+pub struct FoundPackageJsonDepFlag(AtomicFlag);
+
+/// A resolver that takes care of resolution, taking into account loaded
+/// import map, JSX settings.
 #[derive(Debug)]
-pub struct MappedSpecifierResolver {
-  maybe_import_map: Option<Arc<ImportMap>>,
-  package_json_deps_provider: Arc<PackageJsonDepsProvider>,
+pub struct CliResolver {
+  deno_resolver: Arc<CliDenoResolver>,
+  found_package_json_dep_flag: Arc<FoundPackageJsonDepFlag>,
+  warned_pkgs: DashSet<PackageReq>,
 }
 
-impl MappedSpecifierResolver {
+impl CliResolver {
   pub fn new(
-    maybe_import_map: Option<Arc<ImportMap>>,
-    package_json_deps_provider: Arc<PackageJsonDepsProvider>,
+    deno_resolver: Arc<CliDenoResolver>,
+    found_package_json_dep_flag: Arc<FoundPackageJsonDepFlag>,
   ) -> Self {
     Self {
-      maybe_import_map,
-      package_json_deps_provider,
+      deno_resolver,
+      found_package_json_dep_flag,
+      warned_pkgs: Default::default(),
     }
   }
 
   pub fn resolve(
     &self,
-    specifier: &str,
+    raw_specifier: &str,
     referrer: &ModuleSpecifier,
-  ) -> Result<MappedResolution, AnyError> {
-    // attempt to resolve with the import map first
-    let maybe_import_map_err = match self
-      .maybe_import_map
-      .as_ref()
-      .map(|import_map| import_map.resolve(specifier, referrer))
-    {
-      Some(Ok(value)) => return Ok(MappedResolution::ImportMap(value)),
-      Some(Err(err)) => Some(err),
-      None => None,
-    };
+    referrer_range_start: deno_graph::Position,
+    resolution_mode: ResolutionMode,
+    resolution_kind: NodeResolutionKind,
+  ) -> Result<ModuleSpecifier, ResolveError> {
+    let resolution = self
+      .deno_resolver
+      .resolve(raw_specifier, referrer, resolution_mode, resolution_kind)
+      .map_err(|err| match err.into_kind() {
+        deno_resolver::DenoResolveErrorKind::MappedResolution(
+          mapped_resolution_error,
+        ) => match mapped_resolution_error {
+          MappedResolutionError::Specifier(e) => ResolveError::Specifier(e),
+          // deno_graph checks specifically for an ImportMapError
+          MappedResolutionError::ImportMap(e) => ResolveError::ImportMap(e),
+          MappedResolutionError::Workspace(e) => {
+            ResolveError::Other(JsErrorBox::from_err(e))
+          }
+        },
+        err => ResolveError::Other(JsErrorBox::from_err(err)),
+      })?;
 
-    // then with package.json
-    if let Some(deps) = self.package_json_deps_provider.deps() {
-      if let Some(specifier) = resolve_package_json_dep(specifier, deps)? {
-        return Ok(MappedResolution::PackageJson(specifier));
-      }
+    if resolution.found_package_json_dep {
+      // mark that we need to do an "npm install" later
+      self.found_package_json_dep_flag.0.raise();
     }
 
-    // otherwise, surface the import map error or try resolving when has no import map
-    if let Some(err) = maybe_import_map_err {
-      Err(err.into())
-    } else {
-      Ok(MappedResolution::None)
-    }
-  }
-}
-
-/// A resolver that takes care of resolution, taking into account loaded
-/// import map, JSX settings.
-#[derive(Debug)]
-pub struct CliGraphResolver {
-  mapped_specifier_resolver: MappedSpecifierResolver,
-  maybe_default_jsx_import_source: Option<String>,
-  maybe_jsx_import_source_module: Option<String>,
-  maybe_vendor_specifier: Option<ModuleSpecifier>,
-  no_npm: bool,
-  npm_registry_api: Arc<CliNpmRegistryApi>,
-  npm_resolution: Arc<NpmResolution>,
-  package_json_deps_installer: Arc<PackageJsonDepsInstaller>,
-  found_package_json_dep_flag: Arc<AtomicFlag>,
-}
-
-impl Default for CliGraphResolver {
-  fn default() -> Self {
-    // This is not ideal, but necessary for the LSP. In the future, we should
-    // refactor the LSP and force this to be initialized.
-    let npm_registry_api = Arc::new(CliNpmRegistryApi::new_uninitialized());
-    let npm_resolution = Arc::new(NpmResolution::from_serialized(
-      npm_registry_api.clone(),
-      None,
-      None,
-    ));
-    Self {
-      mapped_specifier_resolver: MappedSpecifierResolver {
-        maybe_import_map: Default::default(),
-        package_json_deps_provider: Default::default(),
-      },
-      maybe_default_jsx_import_source: None,
-      maybe_jsx_import_source_module: None,
-      maybe_vendor_specifier: None,
-      no_npm: false,
-      npm_registry_api,
-      npm_resolution,
-      package_json_deps_installer: Default::default(),
-      found_package_json_dep_flag: Default::default(),
-    }
-  }
-}
-
-pub struct CliGraphResolverOptions<'a> {
-  pub maybe_jsx_import_source_config: Option<JsxImportSourceConfig>,
-  pub maybe_import_map: Option<Arc<ImportMap>>,
-  pub maybe_vendor_dir: Option<&'a PathBuf>,
-  pub no_npm: bool,
-}
-
-impl CliGraphResolver {
-  pub fn new(
-    npm_registry_api: Arc<CliNpmRegistryApi>,
-    npm_resolution: Arc<NpmResolution>,
-    package_json_deps_provider: Arc<PackageJsonDepsProvider>,
-    package_json_deps_installer: Arc<PackageJsonDepsInstaller>,
-    options: CliGraphResolverOptions,
-  ) -> Self {
-    Self {
-      mapped_specifier_resolver: MappedSpecifierResolver {
-        maybe_import_map: options.maybe_import_map,
-        package_json_deps_provider,
-      },
-      maybe_default_jsx_import_source: options
-        .maybe_jsx_import_source_config
-        .as_ref()
-        .and_then(|c| c.default_specifier.clone()),
-      maybe_jsx_import_source_module: options
-        .maybe_jsx_import_source_config
-        .map(|c| c.module),
-      maybe_vendor_specifier: options
-        .maybe_vendor_dir
-        .and_then(|v| ModuleSpecifier::from_directory_path(v).ok()),
-      no_npm: options.no_npm,
-      npm_registry_api,
-      npm_resolution,
-      package_json_deps_installer,
-      found_package_json_dep_flag: Default::default(),
-    }
-  }
-
-  pub fn as_graph_resolver(&self) -> &dyn Resolver {
-    self
-  }
-
-  pub fn as_graph_npm_resolver(&self) -> &dyn NpmResolver {
-    self
-  }
-
-  pub async fn force_top_level_package_json_install(
-    &self,
-  ) -> Result<(), AnyError> {
-    self
-      .package_json_deps_installer
-      .ensure_top_level_install()
-      .await
-  }
-
-  pub async fn top_level_package_json_install_if_necessary(
-    &self,
-  ) -> Result<(), AnyError> {
-    if self.found_package_json_dep_flag.is_raised() {
-      self.force_top_level_package_json_install().await?;
-    }
-    Ok(())
-  }
-}
-
-impl Resolver for CliGraphResolver {
-  fn default_jsx_import_source(&self) -> Option<String> {
-    self.maybe_default_jsx_import_source.clone()
-  }
-
-  fn jsx_import_source_module(&self) -> &str {
-    self
-      .maybe_jsx_import_source_module
-      .as_deref()
-      .unwrap_or(DEFAULT_JSX_IMPORT_SOURCE_MODULE)
-  }
-
-  fn resolve(
-    &self,
-    specifier: &str,
-    referrer: &ModuleSpecifier,
-  ) -> Result<ModuleSpecifier, AnyError> {
-    use MappedResolution::*;
-    let result = match self
-      .mapped_specifier_resolver
-      .resolve(specifier, referrer)?
-    {
-      ImportMap(specifier) => Ok(specifier),
-      PackageJson(specifier) => {
-        // found a specifier in the package.json, so mark that
-        // we need to do an "npm install" later
-        self.found_package_json_dep_flag.raise();
-        Ok(specifier)
-      }
-      None => deno_graph::resolve_import(specifier, referrer)
-        .map_err(|err| err.into()),
-    };
-
-    // When the user is vendoring, don't allow them to import directly from the vendor/ directory
-    // as it might cause them confusion or duplicate dependencies. Additionally, this folder has
-    // special treatment in the language server so it will definitely cause issues/confusion there
-    // if they do this.
-    if let Some(vendor_specifier) = &self.maybe_vendor_specifier {
-      if let Ok(specifier) = &result {
-        if specifier.as_str().starts_with(vendor_specifier.as_str()) {
-          bail!("Importing from the vendor directory is not permitted. Use a remote specifier instead or disable vendoring.");
+    if let Some(diagnostic) = resolution.maybe_diagnostic {
+      match &*diagnostic {
+        MappedResolutionDiagnostic::ConstraintNotMatchedLocalVersion {
+          reference,
+          ..
+        } => {
+          if self.warned_pkgs.insert(reference.req().clone()) {
+            log::warn!(
+              "{} {}\n    at {}:{}",
+              colors::yellow("Warning"),
+              diagnostic,
+              referrer,
+              referrer_range_start,
+            );
+          }
         }
       }
     }
 
-    result
+    Ok(resolution.url)
   }
 }
 
-fn resolve_package_json_dep(
-  specifier: &str,
-  deps: &PackageJsonDeps,
-) -> Result<Option<ModuleSpecifier>, AnyError> {
-  for (bare_specifier, req_result) in deps {
-    if specifier.starts_with(bare_specifier) {
-      let path = &specifier[bare_specifier.len()..];
-      if path.is_empty() || path.starts_with('/') {
-        let req = req_result.as_ref().map_err(|err| {
-          anyhow!(
-            "Parsing version constraints in the application-level package.json is more strict at the moment.\n\n{:#}",
-            err.clone()
-          )
-        })?;
-        return Ok(Some(ModuleSpecifier::parse(&format!("npm:{req}{path}"))?));
-      }
+#[derive(Debug)]
+pub struct CliNpmGraphResolver {
+  npm_installer: Option<Arc<NpmInstaller>>,
+  found_package_json_dep_flag: Arc<FoundPackageJsonDepFlag>,
+  bare_node_builtins_enabled: bool,
+  npm_caching: NpmCachingStrategy,
+}
+
+impl CliNpmGraphResolver {
+  pub fn new(
+    npm_installer: Option<Arc<NpmInstaller>>,
+    found_package_json_dep_flag: Arc<FoundPackageJsonDepFlag>,
+    bare_node_builtins_enabled: bool,
+    npm_caching: NpmCachingStrategy,
+  ) -> Self {
+    Self {
+      npm_installer,
+      found_package_json_dep_flag,
+      bare_node_builtins_enabled,
+      npm_caching,
     }
   }
-
-  Ok(None)
 }
 
-impl NpmResolver for CliGraphResolver {
+#[async_trait(?Send)]
+impl deno_graph::source::NpmResolver for CliNpmGraphResolver {
   fn resolve_builtin_node_module(
     &self,
     specifier: &ModuleSpecifier,
@@ -291,114 +293,99 @@ impl NpmResolver for CliGraphResolver {
     }
   }
 
-  fn load_and_cache_npm_package_info(
+  fn on_resolve_bare_builtin_node_module(
     &self,
-    package_name: &str,
-  ) -> LocalBoxFuture<'static, Result<(), AnyError>> {
-    if self.no_npm {
-      // return it succeeded and error at the import site below
-      return Box::pin(future::ready(Ok(())));
+    module_name: &str,
+    range: &deno_graph::Range,
+  ) {
+    let start = range.range.start;
+    let specifier = &range.specifier;
+    if !*DENO_DISABLE_PEDANTIC_NODE_WARNINGS {
+      log::warn!("{} Resolving \"{module_name}\" as \"node:{module_name}\" at {specifier}:{start}. If you want to use a built-in Node module, add a \"node:\" prefix.", colors::yellow("Warning"))
     }
-    // this will internally cache the package information
-    let package_name = package_name.to_string();
-    let api = self.npm_registry_api.clone();
-    async move {
-      api
-        .package_info(&package_name)
-        .await
-        .map(|_| ())
-        .map_err(|err| err.into())
-    }
-    .boxed()
   }
 
-  fn resolve_npm(&self, package_req: &PackageReq) -> NpmPackageReqResolution {
-    if self.no_npm {
-      return NpmPackageReqResolution::Err(anyhow!(
-        "npm specifiers were requested; but --no-npm is specified"
-      ));
+  fn load_and_cache_npm_package_info(&self, package_name: &str) {
+    if let Some(npm_installer) = &self.npm_installer {
+      let npm_installer = npm_installer.clone();
+      let package_name = package_name.to_string();
+      deno_core::unsync::spawn(async move {
+        let _ignore = npm_installer.cache_package_info(&package_name).await;
+      });
     }
+  }
 
-    let result = self
-      .npm_resolution
-      .resolve_package_req_as_pending(package_req);
-    match result {
-      Ok(nv) => NpmPackageReqResolution::Ok(nv),
-      Err(err) => {
-        if self.npm_registry_api.mark_force_reload() {
-          log::debug!("Restarting npm specifier resolution to check for new registry information. Error: {:#}", err);
-          NpmPackageReqResolution::ReloadRegistryInfo(err.into())
+  async fn resolve_pkg_reqs(
+    &self,
+    package_reqs: &[PackageReq],
+  ) -> NpmResolvePkgReqsResult {
+    match &self.npm_installer {
+      Some(npm_installer) => {
+        let top_level_result = if self.found_package_json_dep_flag.0.is_raised()
+        {
+          npm_installer
+            .ensure_top_level_package_json_install()
+            .await
+            .map(|_| ())
         } else {
-          NpmPackageReqResolution::Err(err.into())
+          Ok(())
+        };
+
+        let result = npm_installer
+          .add_package_reqs_raw(
+            package_reqs,
+            match self.npm_caching {
+              NpmCachingStrategy::Eager => Some(PackageCaching::All),
+              NpmCachingStrategy::Lazy => {
+                Some(PackageCaching::Only(package_reqs.into()))
+              }
+              NpmCachingStrategy::Manual => None,
+            },
+          )
+          .await;
+
+        NpmResolvePkgReqsResult {
+          results: result
+            .results
+            .into_iter()
+            .map(|r| {
+              r.map_err(|err| match err {
+                NpmResolutionError::Registry(e) => {
+                  NpmLoadError::RegistryInfo(Arc::new(e))
+                }
+                NpmResolutionError::Resolution(e) => {
+                  NpmLoadError::PackageReqResolution(Arc::new(e))
+                }
+                NpmResolutionError::DependencyEntry(e) => {
+                  NpmLoadError::PackageReqResolution(Arc::new(e))
+                }
+              })
+            })
+            .collect(),
+          dep_graph_result: match top_level_result {
+            Ok(()) => result
+              .dependencies_result
+              .map_err(|e| Arc::new(e) as Arc<dyn deno_error::JsErrorClass>),
+            Err(err) => Err(Arc::new(err)),
+          },
+        }
+      }
+      None => {
+        let err = Arc::new(JsErrorBox::generic(
+          "npm specifiers were requested; but --no-npm is specified",
+        ));
+        NpmResolvePkgReqsResult {
+          results: package_reqs
+            .iter()
+            .map(|_| Err(NpmLoadError::RegistryInfo(err.clone())))
+            .collect(),
+          dep_graph_result: Err(err),
         }
       }
     }
   }
-}
 
-#[cfg(test)]
-mod test {
-  use std::collections::BTreeMap;
-
-  use super::*;
-
-  #[test]
-  fn test_resolve_package_json_dep() {
-    fn resolve(
-      specifier: &str,
-      deps: &BTreeMap<String, PackageReq>,
-    ) -> Result<Option<String>, String> {
-      let deps = deps
-        .iter()
-        .map(|(key, value)| (key.to_string(), Ok(value.clone())))
-        .collect();
-      resolve_package_json_dep(specifier, &deps)
-        .map(|s| s.map(|s| s.to_string()))
-        .map_err(|err| err.to_string())
-    }
-
-    let deps = BTreeMap::from([
-      (
-        "package".to_string(),
-        PackageReq::from_str("package@1.0").unwrap(),
-      ),
-      (
-        "package-alias".to_string(),
-        PackageReq::from_str("package@^1.2").unwrap(),
-      ),
-      (
-        "@deno/test".to_string(),
-        PackageReq::from_str("@deno/test@~0.2").unwrap(),
-      ),
-    ]);
-
-    assert_eq!(
-      resolve("package", &deps).unwrap(),
-      Some("npm:package@1.0".to_string()),
-    );
-    assert_eq!(
-      resolve("package/some_path.ts", &deps).unwrap(),
-      Some("npm:package@1.0/some_path.ts".to_string()),
-    );
-
-    assert_eq!(
-      resolve("@deno/test", &deps).unwrap(),
-      Some("npm:@deno/test@~0.2".to_string()),
-    );
-    assert_eq!(
-      resolve("@deno/test/some_path.ts", &deps).unwrap(),
-      Some("npm:@deno/test@~0.2/some_path.ts".to_string()),
-    );
-    // matches the start, but doesn't have the same length or a path
-    assert_eq!(resolve("@deno/testing", &deps).unwrap(), None,);
-
-    // alias
-    assert_eq!(
-      resolve("package-alias", &deps).unwrap(),
-      Some("npm:package@^1.2".to_string()),
-    );
-
-    // non-existent bare specifier
-    assert_eq!(resolve("non-existent", &deps).unwrap(), None);
+  fn enables_bare_builtin_node_module(&self) -> bool {
+    self.bare_node_builtins_enabled
   }
 }

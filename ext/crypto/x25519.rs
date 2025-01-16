@@ -1,15 +1,25 @@
-// Copyright 2018-2023 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 
 use curve25519_dalek::montgomery::MontgomeryPoint;
-use deno_core::error::AnyError;
 use deno_core::op2;
 use deno_core::ToJsBuffer;
 use elliptic_curve::pkcs8::PrivateKeyInfo;
 use elliptic_curve::subtle::ConstantTimeEq;
 use rand::rngs::OsRng;
 use rand::RngCore;
+use spki::der::asn1::BitString;
 use spki::der::Decode;
 use spki::der::Encode;
+
+#[derive(Debug, thiserror::Error, deno_error::JsError)]
+pub enum X25519Error {
+  #[class("DOMExceptionOperationError")]
+  #[error("Failed to export key")]
+  FailedExport,
+  #[class(generic)]
+  #[error(transparent)]
+  Der(#[from] spki::der::Error),
+}
 
 #[op2(fast)]
 pub fn op_crypto_generate_x25519_keypair(
@@ -45,10 +55,10 @@ pub fn op_crypto_derive_bits_x25519(
   let sh_sec = x25519_dalek::x25519(k, u);
   let point = MontgomeryPoint(sh_sec);
   if point.ct_eq(&MONTGOMERY_IDENTITY).unwrap_u8() == 1 {
-    return false;
+    return true;
   }
   secret.copy_from_slice(&sh_sec);
-  true
+  false
 }
 
 // id-X25519 OBJECT IDENTIFIER ::= { 1 3 101 110 }
@@ -61,7 +71,7 @@ pub fn op_crypto_import_spki_x25519(
   #[buffer] out: &mut [u8],
 ) -> bool {
   // 2-3.
-  let pk_info = match spki::SubjectPublicKeyInfo::from_der(key_data) {
+  let pk_info = match spki::SubjectPublicKeyInfoRef::try_from(key_data) {
     Ok(pk_info) => pk_info,
     Err(_) => return false,
   };
@@ -74,7 +84,7 @@ pub fn op_crypto_import_spki_x25519(
   if pk_info.algorithm.parameters.is_some() {
     return false;
   }
-  out.copy_from_slice(pk_info.subject_public_key);
+  out.copy_from_slice(pk_info.subject_public_key.raw_bytes());
   true
 }
 
@@ -111,27 +121,34 @@ pub fn op_crypto_import_pkcs8_x25519(
 #[serde]
 pub fn op_crypto_export_spki_x25519(
   #[buffer] pubkey: &[u8],
-) -> Result<ToJsBuffer, AnyError> {
+) -> Result<ToJsBuffer, X25519Error> {
   let key_info = spki::SubjectPublicKeyInfo {
-    algorithm: spki::AlgorithmIdentifier {
+    algorithm: spki::AlgorithmIdentifierRef {
       // id-X25519
       oid: X25519_OID,
       parameters: None,
     },
-    subject_public_key: pubkey,
+    subject_public_key: BitString::from_bytes(pubkey)?,
   };
-  Ok(key_info.to_vec()?.into())
+  Ok(
+    key_info
+      .to_der()
+      .map_err(|_| X25519Error::FailedExport)?
+      .into(),
+  )
 }
 
 #[op2]
 #[serde]
 pub fn op_crypto_export_pkcs8_x25519(
   #[buffer] pkey: &[u8],
-) -> Result<ToJsBuffer, AnyError> {
+) -> Result<ToJsBuffer, X25519Error> {
+  use rsa::pkcs1::der::Encode;
+
   // This should probably use OneAsymmetricKey instead
   let pk_info = rsa::pkcs8::PrivateKeyInfo {
     public_key: None,
-    algorithm: rsa::pkcs8::AlgorithmIdentifier {
+    algorithm: rsa::pkcs8::AlgorithmIdentifierRef {
       // id-X25519
       oid: X25519_OID,
       parameters: None,
@@ -139,5 +156,7 @@ pub fn op_crypto_export_pkcs8_x25519(
     private_key: pkey, // OCTET STRING
   };
 
-  Ok(pk_info.to_vec()?.into())
+  let mut buf = Vec::new();
+  pk_info.encode_to_vec(&mut buf)?;
+  Ok(buf.into())
 }

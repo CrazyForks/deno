@@ -1,4 +1,4 @@
-// Copyright 2018-2023 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 // Copyright (c) 2014-2015 Devon Govett <devongovett@gmail.com>
 // Forked from https://github.com/browserify/browserify-zlib
 
@@ -14,6 +14,7 @@ import { nextTick } from "ext:deno_node/_next_tick.ts";
 import {
   isAnyArrayBuffer,
   isArrayBufferView,
+  isUint8Array,
 } from "ext:deno_node/internal/util/types.ts";
 
 var kRangeErrorMessage = "Cannot create final Buffer. It would be larger " +
@@ -155,9 +156,32 @@ export const inflateRawSync = function (buffer, opts) {
   return zlibBufferSync(new InflateRaw(opts), buffer);
 };
 
+function sanitizeInput(input) {
+  if (typeof input === "string") input = Buffer.from(input);
+
+  if (isArrayBufferView(input) && !isUint8Array(input)) {
+    input = Buffer.from(input.buffer, input.byteOffset, input.byteLength);
+  } else if (isAnyArrayBuffer(input)) {
+    input = Buffer.from(input);
+  }
+
+  if (
+    !Buffer.isBuffer(input) &&
+    (input.buffer && !input.buffer.constructor === ArrayBuffer)
+  ) throw new TypeError("Not a string, buffer or dataview");
+
+  if (input.buffer) {
+    input = new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
+  }
+
+  return input;
+}
+
 function zlibBuffer(engine, buffer, callback) {
   var buffers = [];
   var nread = 0;
+
+  buffer = sanitizeInput(buffer);
 
   engine.on("error", onError);
   engine.on("end", onEnd);
@@ -197,9 +221,7 @@ function zlibBuffer(engine, buffer, callback) {
 }
 
 function zlibBufferSync(engine, buffer) {
-  if (typeof buffer === "string") buffer = Buffer.from(buffer);
-
-  if (!Buffer.isBuffer(buffer)) throw new TypeError("Not a string or buffer");
+  buffer = sanitizeInput(buffer);
 
   var flushFlag = engine._finishFlushFlag;
 

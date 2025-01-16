@@ -1,30 +1,43 @@
-// Copyright 2018-2023 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 
-const primordials = globalThis.__bootstrap.primordials;
+import { primordials } from "ext:core/mod.js";
+import { op_now, op_time_origin } from "ext:core/ops";
 const {
   ArrayPrototypeFilter,
-  ArrayPrototypeFind,
   ArrayPrototypePush,
-  ArrayPrototypeReverse,
-  ArrayPrototypeSlice,
   ObjectKeys,
   ObjectPrototypeIsPrototypeOf,
   ReflectHas,
   Symbol,
   SymbolFor,
   TypeError,
+  TypedArrayPrototypeGetBuffer,
+  Uint8Array,
+  Uint32Array,
 } = primordials;
+
 import * as webidl from "ext:deno_webidl/00_webidl.js";
-import { structuredClone } from "ext:deno_web/02_structured_clone.js";
+import { structuredClone } from "./02_structured_clone.js";
 import { createFilteredInspectProxy } from "ext:deno_console/01_console.js";
-import { EventTarget } from "ext:deno_web/02_event.js";
-import { opNow } from "ext:deno_web/02_timers.js";
-import DOMException from "ext:deno_web/01_dom_exception.js";
+import { EventTarget } from "./02_event.js";
+import { DOMException } from "./01_dom_exception.js";
 
 const illegalConstructorKey = Symbol("illegalConstructorKey");
-const customInspect = SymbolFor("Deno.customInspect");
 let performanceEntries = [];
 let timeOrigin;
+
+const hrU8 = new Uint8Array(8);
+const hr = new Uint32Array(TypedArrayPrototypeGetBuffer(hrU8));
+
+function setTimeOrigin() {
+  op_time_origin(hrU8);
+  timeOrigin = hr[0] * 1000 + hr[1] / 1e6;
+}
+
+function now() {
+  op_now(hrU8);
+  return hr[0] * 1000 + hr[1] / 1e6;
+}
 
 webidl.converters["PerformanceMarkOptions"] = webidl
   .createDictionaryConverter(
@@ -93,18 +106,16 @@ webidl.converters["DOMString or PerformanceMeasureOptions"] = (
   return webidl.converters.DOMString(V, prefix, context, opts);
 };
 
-function setTimeOrigin(origin) {
-  timeOrigin = origin;
-}
-
 function findMostRecent(
   name,
   type,
 ) {
-  return ArrayPrototypeFind(
-    ArrayPrototypeReverse(ArrayPrototypeSlice(performanceEntries)),
-    (entry) => entry.name === name && entry.entryType === type,
-  );
+  for (let i = performanceEntries.length - 1; i >= 0; --i) {
+    const entry = performanceEntries[i];
+    if (entry.name === name && entry.entryType === type) {
+      return entry;
+    }
+  }
 }
 
 function convertMarkToTimestamp(mark) {
@@ -112,14 +123,14 @@ function convertMarkToTimestamp(mark) {
     const entry = findMostRecent(mark, "mark");
     if (!entry) {
       throw new DOMException(
-        `Cannot find mark: "${mark}".`,
+        `Cannot find mark: "${mark}"`,
         "SyntaxError",
       );
     }
     return entry.startTime;
   }
   if (mark < 0) {
-    throw new TypeError("Mark cannot be negative.");
+    throw new TypeError(`Mark cannot be negative: received ${mark}`);
   }
   return mark;
 }
@@ -135,8 +146,6 @@ function filterByNameType(
       (type ? entry.entryType === type : true),
   );
 }
-
-const now = opNow;
 
 const _name = Symbol("[[name]]");
 const _entryType = Symbol("[[entryType]]");
@@ -196,23 +205,26 @@ class PerformanceEntry {
     };
   }
 
-  [customInspect](inspect) {
-    return inspect(createFilteredInspectProxy({
-      object: this,
-      evaluate: ObjectPrototypeIsPrototypeOf(
-        PerformanceEntryPrototype,
-        this,
-      ),
-      keys: [
-        "name",
-        "entryType",
-        "startTime",
-        "duration",
-      ],
-    }));
+  [SymbolFor("Deno.privateCustomInspect")](inspect, inspectOptions) {
+    return inspect(
+      createFilteredInspectProxy({
+        object: this,
+        evaluate: ObjectPrototypeIsPrototypeOf(
+          PerformanceEntryPrototype,
+          this,
+        ),
+        keys: [
+          "name",
+          "entryType",
+          "startTime",
+          "duration",
+        ],
+      }),
+      inspectOptions,
+    );
   }
 }
-webidl.configurePrototype(PerformanceEntry);
+webidl.configureInterface(PerformanceEntry);
 const PerformanceEntryPrototype = PerformanceEntry.prototype;
 
 const _detail = Symbol("[[detail]]");
@@ -231,7 +243,7 @@ class PerformanceMark extends PerformanceEntry {
 
   constructor(
     name,
-    options = {},
+    options = { __proto__: null },
   ) {
     const prefix = "Failed to construct 'PerformanceMark'";
     webidl.requiredArguments(arguments.length, 1, prefix);
@@ -249,7 +261,9 @@ class PerformanceMark extends PerformanceEntry {
     super(name, "mark", startTime, 0, illegalConstructorKey);
     this[webidl.brand] = webidl.brand;
     if (startTime < 0) {
-      throw new TypeError("startTime cannot be negative");
+      throw new TypeError(
+        `Cannot construct PerformanceMark: startTime cannot be negative, received ${startTime}`,
+      );
     }
     this[_detail] = structuredClone(detail);
   }
@@ -265,21 +279,24 @@ class PerformanceMark extends PerformanceEntry {
     };
   }
 
-  [customInspect](inspect) {
-    return inspect(createFilteredInspectProxy({
-      object: this,
-      evaluate: ObjectPrototypeIsPrototypeOf(PerformanceMarkPrototype, this),
-      keys: [
-        "name",
-        "entryType",
-        "startTime",
-        "duration",
-        "detail",
-      ],
-    }));
+  [SymbolFor("Deno.privateCustomInspect")](inspect, inspectOptions) {
+    return inspect(
+      createFilteredInspectProxy({
+        object: this,
+        evaluate: ObjectPrototypeIsPrototypeOf(PerformanceMarkPrototype, this),
+        keys: [
+          "name",
+          "entryType",
+          "startTime",
+          "duration",
+          "detail",
+        ],
+      }),
+      inspectOptions,
+    );
   }
 }
-webidl.configurePrototype(PerformanceMark);
+webidl.configureInterface(PerformanceMark);
 const PerformanceMarkPrototype = PerformanceMark.prototype;
 class PerformanceMeasure extends PerformanceEntry {
   [_detail] = null;
@@ -321,24 +338,27 @@ class PerformanceMeasure extends PerformanceEntry {
     };
   }
 
-  [customInspect](inspect) {
-    return inspect(createFilteredInspectProxy({
-      object: this,
-      evaluate: ObjectPrototypeIsPrototypeOf(
-        PerformanceMeasurePrototype,
-        this,
-      ),
-      keys: [
-        "name",
-        "entryType",
-        "startTime",
-        "duration",
-        "detail",
-      ],
-    }));
+  [SymbolFor("Deno.privateCustomInspect")](inspect, inspectOptions) {
+    return inspect(
+      createFilteredInspectProxy({
+        object: this,
+        evaluate: ObjectPrototypeIsPrototypeOf(
+          PerformanceMeasurePrototype,
+          this,
+        ),
+        keys: [
+          "name",
+          "entryType",
+          "startTime",
+          "duration",
+          "detail",
+        ],
+      }),
+      inspectOptions,
+    );
   }
 }
-webidl.configurePrototype(PerformanceMeasure);
+webidl.configureInterface(PerformanceMeasure);
 const PerformanceMeasurePrototype = PerformanceMeasure.prototype;
 class Performance extends EventTarget {
   constructor(key = null) {
@@ -432,7 +452,7 @@ class Performance extends EventTarget {
 
   mark(
     markName,
-    markOptions = {},
+    markOptions = { __proto__: null },
   ) {
     webidl.assertBranded(this, PerformancePrototype);
     const prefix = "Failed to execute 'mark' on 'Performance'";
@@ -457,7 +477,7 @@ class Performance extends EventTarget {
 
   measure(
     measureName,
-    startOrMeasureOptions = {},
+    startOrMeasureOptions = { __proto__: null },
     endMark = undefined,
   ) {
     webidl.assertBranded(this, PerformancePrototype);
@@ -486,14 +506,14 @@ class Performance extends EventTarget {
       ObjectKeys(startOrMeasureOptions).length > 0
     ) {
       if (endMark) {
-        throw new TypeError("Options cannot be passed with endMark.");
+        throw new TypeError('Options cannot be passed with "endMark"');
       }
       if (
         !ReflectHas(startOrMeasureOptions, "start") &&
         !ReflectHas(startOrMeasureOptions, "end")
       ) {
         throw new TypeError(
-          "A start or end mark must be supplied in options.",
+          'A "start" or "end" mark must be supplied in options',
         );
       }
       if (
@@ -502,7 +522,7 @@ class Performance extends EventTarget {
         ReflectHas(startOrMeasureOptions, "end")
       ) {
         throw new TypeError(
-          "Cannot specify start, end, and duration together in options.",
+          'Cannot specify "start", "end", and "duration" together in options',
         );
       }
     }
@@ -569,15 +589,18 @@ class Performance extends EventTarget {
     };
   }
 
-  [customInspect](inspect) {
-    return inspect(createFilteredInspectProxy({
-      object: this,
-      evaluate: ObjectPrototypeIsPrototypeOf(PerformancePrototype, this),
-      keys: [],
-    }));
+  [SymbolFor("Deno.privateCustomInspect")](inspect, inspectOptions) {
+    return inspect(
+      createFilteredInspectProxy({
+        object: this,
+        evaluate: ObjectPrototypeIsPrototypeOf(PerformancePrototype, this),
+        keys: ["timeOrigin"],
+      }),
+      inspectOptions,
+    );
   }
 }
-webidl.configurePrototype(Performance);
+webidl.configureInterface(Performance);
 const PerformancePrototype = Performance.prototype;
 
 webidl.converters["Performance"] = webidl.createInterfaceConverter(

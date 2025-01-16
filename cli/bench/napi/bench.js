@@ -1,6 +1,6 @@
-// Copyright 2018-2023 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 
-import { loadTestLibrary } from "../../../test_napi/common.js";
+import { loadTestLibrary } from "../../../tests/napi/common.js";
 
 const lib = loadTestLibrary();
 

@@ -1,22 +1,22 @@
-// Copyright 2018-2023 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 
 // @ts-check
 /// <reference path="../../core/internal.d.ts" />
 
-import { EventTarget } from "ext:deno_web/02_event.js";
-const primordials = globalThis.__bootstrap.primordials;
+import { primordials } from "ext:core/mod.js";
 const {
   Symbol,
   SymbolToStringTag,
   TypeError,
 } = primordials;
+import { EventTarget } from "./02_event.js";
 
 const illegalConstructorKey = Symbol("illegalConstructorKey");
 
 class Window extends EventTarget {
   constructor(key = null) {
     if (key !== illegalConstructorKey) {
-      throw new TypeError("Illegal constructor.");
+      throw new TypeError("Illegal constructor");
     }
     super();
   }
@@ -29,7 +29,7 @@ class Window extends EventTarget {
 class WorkerGlobalScope extends EventTarget {
   constructor(key = null) {
     if (key != illegalConstructorKey) {
-      throw new TypeError("Illegal constructor.");
+      throw new TypeError("Illegal constructor");
     }
     super();
   }
@@ -42,7 +42,7 @@ class WorkerGlobalScope extends EventTarget {
 class DedicatedWorkerGlobalScope extends WorkerGlobalScope {
   constructor(key = null) {
     if (key != illegalConstructorKey) {
-      throw new TypeError("Illegal constructor.");
+      throw new TypeError("Illegal constructor");
     }
     super();
   }

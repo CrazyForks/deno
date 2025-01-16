@@ -1,4 +1,4 @@
-// Copyright 2018-2023 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 
 use super::*;
 
@@ -28,6 +28,12 @@ impl TestReporter for CompoundTestReporter {
   fn report_wait(&mut self, description: &TestDescription) {
     for reporter in &mut self.test_reporters {
       reporter.report_wait(description);
+    }
+  }
+
+  fn report_slow(&mut self, description: &TestDescription, elapsed: u64) {
+    for reporter in &mut self.test_reporters {
+      reporter.report_slow(description, elapsed);
     }
   }
 
@@ -101,6 +107,12 @@ impl TestReporter for CompoundTestReporter {
     }
   }
 
+  fn report_completed(&mut self) {
+    for reporter in &mut self.test_reporters {
+      reporter.report_completed();
+    }
+  }
+
   fn flush_report(
     &mut self,
     elapsed: &Duration,
@@ -117,7 +129,7 @@ impl TestReporter for CompoundTestReporter {
     if errors.is_empty() {
       Ok(())
     } else {
-      bail!(
+      anyhow::bail!(
         "error in one or more wrapped reporters:\n{}",
         errors
           .iter()

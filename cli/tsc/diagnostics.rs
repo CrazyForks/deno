@@ -1,13 +1,16 @@
-// Copyright 2018-2023 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 
-use deno_runtime::colors;
+use std::error::Error;
+use std::fmt;
 
+use deno_ast::ModuleSpecifier;
 use deno_core::serde::Deserialize;
 use deno_core::serde::Deserializer;
 use deno_core::serde::Serialize;
 use deno_core::serde::Serializer;
-use std::error::Error;
-use std::fmt;
+use deno_core::sourcemap::SourceMap;
+use deno_graph::ModuleGraph;
+use deno_terminal::colors;
 
 const MAX_SOURCE_LINE_LENGTH: usize = 150;
 
@@ -87,9 +90,9 @@ impl DiagnosticMessageChain {
     s.push_str(&" ".repeat(level * 2));
     s.push_str(&self.message_text);
     if let Some(next) = &self.next {
-      s.push('\n');
       let arr = next.clone();
       for dm in arr {
+        s.push('\n');
         s.push_str(&dm.format_message(level + 1));
       }
     }
@@ -101,8 +104,19 @@ impl DiagnosticMessageChain {
 #[derive(Debug, Deserialize, Serialize, Clone, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Position {
+  /// 0-indexed line number
   pub line: u64,
+  /// 0-indexed character number
   pub character: u64,
+}
+
+impl Position {
+  pub fn from_deno_graph(deno_graph_position: deno_graph::Position) -> Self {
+    Self {
+      line: deno_graph_position.line as u64,
+      character: deno_graph_position.character as u64,
+    }
+  }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Eq, PartialEq)]
@@ -112,15 +126,72 @@ pub struct Diagnostic {
   pub code: u64,
   pub start: Option<Position>,
   pub end: Option<Position>,
+  /// Position of this diagnostic in the original non-mapped source.
+  ///
+  /// This will exist and be different from the `start` for fast
+  /// checked modules where the TypeScript source will differ
+  /// from the original source.
+  #[serde(skip_serializing)]
+  pub original_source_start: Option<Position>,
   pub message_text: Option<String>,
+  #[serde(skip_serializing_if = "Option::is_none")]
   pub message_chain: Option<DiagnosticMessageChain>,
+  #[serde(skip_serializing_if = "Option::is_none")]
   pub source: Option<String>,
   pub source_line: Option<String>,
   pub file_name: Option<String>,
+  #[serde(skip_serializing_if = "Option::is_none")]
   pub related_information: Option<Vec<Diagnostic>>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub reports_deprecated: Option<bool>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub reports_unnecessary: Option<bool>,
+  #[serde(flatten)]
+  pub other: deno_core::serde_json::Map<String, deno_core::serde_json::Value>,
 }
 
 impl Diagnostic {
+  pub fn from_missing_error(
+    specifier: &ModuleSpecifier,
+    maybe_range: Option<&deno_graph::Range>,
+    additional_message: Option<String>,
+  ) -> Self {
+    Self {
+      category: DiagnosticCategory::Error,
+      code: 2307,
+      start: maybe_range.map(|r| Position::from_deno_graph(r.range.start)),
+      end: maybe_range.map(|r| Position::from_deno_graph(r.range.end)),
+      original_source_start: None, // will be applied later
+      message_text: Some(format!(
+        "Cannot find module '{}'.{}{}",
+        specifier,
+        if additional_message.is_none() {
+          ""
+        } else {
+          " "
+        },
+        additional_message.unwrap_or_default()
+      )),
+      message_chain: None,
+      source: None,
+      source_line: None,
+      file_name: maybe_range.map(|r| r.specifier.to_string()),
+      related_information: None,
+      reports_deprecated: None,
+      reports_unnecessary: None,
+      other: Default::default(),
+    }
+  }
+
+  /// If this diagnostic should be included when it comes from a remote module.
+  pub fn include_when_remote(&self) -> bool {
+    /// TS6133: value is declared but its value is never read (noUnusedParameters and noUnusedLocals)
+    const TS6133: u64 = 6133;
+    /// TS4114: This member must have an 'override' modifier because it overrides a member in the base class 'X'.
+    const TS4114: u64 = 4114;
+    !matches!(self.code, TS6133 | TS4114)
+  }
+
   fn fmt_category_and_code(&self, f: &mut fmt::Formatter) -> fmt::Result {
     let category = match self.category {
       DiagnosticCategory::Error => "ERROR",
@@ -142,9 +213,10 @@ impl Diagnostic {
   }
 
   fn fmt_frame(&self, f: &mut fmt::Formatter, level: usize) -> fmt::Result {
-    if let (Some(file_name), Some(start)) =
-      (self.file_name.as_ref(), self.start.as_ref())
-    {
+    if let (Some(file_name), Some(start)) = (
+      self.file_name.as_ref(),
+      self.original_source_start.as_ref().or(self.start.as_ref()),
+    ) {
       write!(
         f,
         "\n{:indent$}    at {}:{}:{}",
@@ -248,7 +320,8 @@ impl fmt::Display for Diagnostic {
   }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, deno_error::JsError)]
+#[class(generic)]
 pub struct Diagnostics(Vec<Diagnostic>);
 
 impl Diagnostics {
@@ -257,18 +330,82 @@ impl Diagnostics {
     Diagnostics(diagnostics)
   }
 
+  pub fn emit_warnings(&mut self) {
+    self.0.retain(|d| {
+      if d.category == DiagnosticCategory::Warning {
+        log::warn!("{}\n", d);
+        false
+      } else {
+        true
+      }
+    });
+  }
+
+  pub fn push(&mut self, diagnostic: Diagnostic) {
+    self.0.push(diagnostic);
+  }
+
+  pub fn extend(&mut self, diagnostic: Diagnostics) {
+    self.0.extend(diagnostic.0);
+  }
+
   /// Return a set of diagnostics where only the values where the predicate
   /// returns `true` are included.
-  pub fn filter<P>(&self, predicate: P) -> Self
+  pub fn filter<P>(self, predicate: P) -> Self
   where
-    P: FnMut(&Diagnostic) -> Option<Diagnostic>,
+    P: FnMut(&Diagnostic) -> bool,
   {
-    let diagnostics = self.0.iter().filter_map(predicate).collect();
+    let diagnostics = self.0.into_iter().filter(predicate).collect();
     Self(diagnostics)
   }
 
   pub fn is_empty(&self) -> bool {
     self.0.is_empty()
+  }
+
+  /// Modifies all the diagnostics to have their display positions
+  /// modified to point at the original source.
+  pub fn apply_fast_check_source_maps(&mut self, graph: &ModuleGraph) {
+    fn visit_diagnostic(d: &mut Diagnostic, graph: &ModuleGraph) {
+      if let Some(specifier) = d
+        .file_name
+        .as_ref()
+        .and_then(|n| ModuleSpecifier::parse(n).ok())
+      {
+        if let Ok(Some(module)) = graph.try_get_prefer_types(&specifier) {
+          if let Some(fast_check_module) =
+            module.js().and_then(|m| m.fast_check_module())
+          {
+            // todo(dsherret): use a short lived cache to prevent parsing
+            // source maps so often
+            if let Ok(source_map) =
+              SourceMap::from_slice(fast_check_module.source_map.as_bytes())
+            {
+              if let Some(start) = d.start.as_mut() {
+                let maybe_token = source_map
+                  .lookup_token(start.line as u32, start.character as u32);
+                if let Some(token) = maybe_token {
+                  d.original_source_start = Some(Position {
+                    line: token.get_src_line() as u64,
+                    character: token.get_src_col() as u64,
+                  });
+                }
+              }
+            }
+          }
+        }
+      }
+
+      if let Some(related) = &mut d.related_information {
+        for d in related.iter_mut() {
+          visit_diagnostic(d, graph);
+        }
+      }
+    }
+
+    for d in &mut self.0 {
+      visit_diagnostic(d, graph);
+    }
   }
 }
 
@@ -314,10 +451,11 @@ impl Error for Diagnostics {}
 
 #[cfg(test)]
 mod tests {
-  use super::*;
   use deno_core::serde_json;
   use deno_core::serde_json::json;
   use test_util::strip_ansi_codes;
+
+  use super::*;
 
   #[test]
   fn test_de_diagnostics() {

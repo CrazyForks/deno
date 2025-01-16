@@ -1,20 +1,16 @@
-// Copyright 2018-2023 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 
-use deno_core::error::bad_resource_id;
-use deno_core::error::type_error;
-use deno_core::error::AnyError;
-use deno_core::op;
-use deno_core::op2;
-use deno_core::OpState;
-use libz_sys::*;
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::future::Future;
-use std::rc::Rc;
+
+use deno_core::op2;
+use deno_error::JsErrorBox;
+use libc::c_ulong;
+use zlib::*;
 
 mod alloc;
 pub mod brotli;
-mod mode;
+pub mod mode;
 mod stream;
 
 use mode::Flush;
@@ -23,20 +19,12 @@ use mode::Mode;
 use self::stream::StreamWrapper;
 
 #[inline]
-fn check(condition: bool, msg: &str) -> Result<(), AnyError> {
+fn check(condition: bool, msg: &str) -> Result<(), JsErrorBox> {
   if condition {
     Ok(())
   } else {
-    Err(type_error(msg.to_string()))
+    Err(JsErrorBox::type_error(msg.to_string()))
   }
-}
-
-#[inline]
-fn zlib(state: &mut OpState, handle: u32) -> Result<Rc<Zlib>, AnyError> {
-  state
-    .resource_table
-    .get::<Zlib>(handle)
-    .map_err(|_| bad_resource_id())
 }
 
 #[derive(Default)]
@@ -70,7 +58,7 @@ impl ZlibInner {
     out_off: u32,
     out_len: u32,
     flush: Flush,
-  ) -> Result<(), AnyError> {
+  ) -> Result<(), JsErrorBox> {
     check(self.init_done, "write before init")?;
     check(!self.write_in_progress, "write already in progress")?;
     check(!self.pending_close, "close already in progress")?;
@@ -79,11 +67,11 @@ impl ZlibInner {
 
     let next_in = input
       .get(in_off as usize..in_off as usize + in_len as usize)
-      .ok_or_else(|| type_error("invalid input range"))?
+      .ok_or_else(|| JsErrorBox::type_error("invalid input range"))?
       .as_ptr() as *mut _;
     let next_out = out
       .get_mut(out_off as usize..out_off as usize + out_len as usize)
-      .ok_or_else(|| type_error("invalid output range"))?
+      .ok_or_else(|| JsErrorBox::type_error("invalid output range"))?
       .as_mut_ptr();
 
     self.strm.avail_in = in_len;
@@ -95,7 +83,7 @@ impl ZlibInner {
     Ok(())
   }
 
-  fn do_write(&mut self, flush: Flush) -> Result<(), AnyError> {
+  fn do_write(&mut self, flush: Flush) -> Result<(), JsErrorBox> {
     self.flush = flush;
     match self.mode {
       Mode::Deflate | Mode::Gzip | Mode::DeflateRaw => {
@@ -141,7 +129,7 @@ impl ZlibInner {
             self.mode = Mode::Inflate;
           }
         } else if next_expected_header_byte.is_some() {
-          return Err(type_error(
+          return Err(JsErrorBox::type_error(
             "invalid number of gzip magic number bytes read",
           ));
         }
@@ -158,7 +146,7 @@ impl ZlibInner {
         self.err = self.strm.inflate(self.flush);
         // TODO(@littledivy): Use if let chain when it is stable.
         // https://github.com/rust-lang/rust/issues/53667
-        // 
+        //
         // Data was encoded with dictionary
         if let (Z_NEED_DICT, Some(dictionary)) = (self.err, &self.dictionary) {
           self.err = self.strm.inflate_set_dictionary(dictionary);
@@ -195,7 +183,7 @@ impl ZlibInner {
     Ok(())
   }
 
-  fn init_stream(&mut self) -> Result<(), AnyError> {
+  fn init_stream(&mut self) -> Result<(), JsErrorBox> {
     match self.mode {
       Mode::Gzip | Mode::Gunzip => self.window_bits += 16,
       Mode::Unzip => self.window_bits += 32,
@@ -213,7 +201,7 @@ impl ZlibInner {
       Mode::Inflate | Mode::Gunzip | Mode::InflateRaw | Mode::Unzip => {
         self.strm.inflate_init(self.window_bits)
       }
-      Mode::None => return Err(type_error("Unknown mode")),
+      Mode::None => return Err(JsErrorBox::type_error("Unknown mode")),
     };
 
     self.write_in_progress = false;
@@ -222,7 +210,7 @@ impl ZlibInner {
     Ok(())
   }
 
-  fn close(&mut self) -> Result<bool, AnyError> {
+  fn close(&mut self) -> Result<bool, JsErrorBox> {
     if self.write_in_progress {
       self.pending_close = true;
       return Ok(false);
@@ -236,16 +224,16 @@ impl ZlibInner {
     Ok(true)
   }
 
-  fn reset_stream(&mut self) -> Result<(), AnyError> {
+  fn reset_stream(&mut self) {
     self.err = self.strm.reset(self.mode);
-
-    Ok(())
   }
 }
 
 struct Zlib {
-  inner: RefCell<ZlibInner>,
+  inner: RefCell<Option<ZlibInner>>,
 }
+
+impl deno_core::GarbageCollected for Zlib {}
 
 impl deno_core::Resource for Zlib {
   fn name(&self) -> Cow<str> {
@@ -253,12 +241,9 @@ impl deno_core::Resource for Zlib {
   }
 }
 
-#[op2(fast)]
-#[smi]
-pub fn op_zlib_new(
-  state: &mut OpState,
-  #[smi] mode: i32,
-) -> Result<u32, AnyError> {
+#[op2]
+#[cppgc]
+pub fn op_zlib_new(#[smi] mode: i32) -> Result<Zlib, mode::ModeError> {
   let mode = Mode::try_from(mode)?;
 
   let inner = ZlibInner {
@@ -266,18 +251,36 @@ pub fn op_zlib_new(
     ..Default::default()
   };
 
-  Ok(state.resource_table.add(Zlib {
-    inner: RefCell::new(inner),
-  }))
+  Ok(Zlib {
+    inner: RefCell::new(Some(inner)),
+  })
+}
+
+#[derive(Debug, thiserror::Error, deno_error::JsError)]
+pub enum ZlibError {
+  #[class(type)]
+  #[error("zlib not initialized")]
+  NotInitialized,
+  #[class(inherit)]
+  #[error(transparent)]
+  Mode(
+    #[from]
+    #[inherit]
+    mode::ModeError,
+  ),
+  #[class(inherit)]
+  #[error(transparent)]
+  Other(
+    #[from]
+    #[inherit]
+    JsErrorBox,
+  ),
 }
 
 #[op2(fast)]
-pub fn op_zlib_close(
-  state: &mut OpState,
-  #[smi] handle: u32,
-) -> Result<(), AnyError> {
-  let resource = zlib(state, handle)?;
-  let mut zlib = resource.inner.borrow_mut();
+pub fn op_zlib_close(#[cppgc] resource: &Zlib) -> Result<(), ZlibError> {
+  let mut resource = resource.inner.borrow_mut();
+  let zlib = resource.as_mut().ok_or(ZlibError::NotInitialized)?;
 
   // If there is a pending write, defer the close until the write is done.
   zlib.close()?;
@@ -285,55 +288,23 @@ pub fn op_zlib_close(
   Ok(())
 }
 
-#[op]
-pub fn op_zlib_write_async(
-  state: Rc<RefCell<OpState>>,
-  handle: u32,
-  flush: i32,
-  input: &[u8],
-  in_off: u32,
-  in_len: u32,
-  out: &mut [u8],
-  out_off: u32,
-  out_len: u32,
-) -> Result<
-  impl Future<Output = Result<(i32, u32, u32), AnyError>> + 'static,
-  AnyError,
-> {
-  let mut state_mut = state.borrow_mut();
-  let resource = zlib(&mut state_mut, handle)?;
-
-  let mut strm = resource.inner.borrow_mut();
-  let flush = Flush::try_from(flush)?;
-  strm.start_write(input, in_off, in_len, out, out_off, out_len, flush)?;
-
-  let state = state.clone();
-  Ok(async move {
-    let mut state_mut = state.borrow_mut();
-    let resource = zlib(&mut state_mut, handle)?;
-    let mut zlib = resource.inner.borrow_mut();
-
-    zlib.do_write(flush)?;
-    Ok((zlib.err, zlib.strm.avail_out, zlib.strm.avail_in))
-  })
-}
-
-#[op]
+#[allow(clippy::too_many_arguments)]
+#[op2(fast)]
+#[smi]
 pub fn op_zlib_write(
-  state: &mut OpState,
-  handle: u32,
-  flush: i32,
-  input: &[u8],
-  in_off: u32,
-  in_len: u32,
-  out: &mut [u8],
-  out_off: u32,
-  out_len: u32,
-  result: &mut [u32],
-) -> Result<i32, AnyError> {
-  let resource = zlib(state, handle)?;
-
+  #[cppgc] resource: &Zlib,
+  #[smi] flush: i32,
+  #[buffer] input: &[u8],
+  #[smi] in_off: u32,
+  #[smi] in_len: u32,
+  #[buffer] out: &mut [u8],
+  #[smi] out_off: u32,
+  #[smi] out_len: u32,
+  #[buffer] result: &mut [u32],
+) -> Result<i32, ZlibError> {
   let mut zlib = resource.inner.borrow_mut();
+  let zlib = zlib.as_mut().ok_or(ZlibError::NotInitialized)?;
+
   let flush = Flush::try_from(flush)?;
   zlib.start_write(input, in_off, in_len, out, out_off, out_len, flush)?;
   zlib.do_write(flush)?;
@@ -344,18 +315,18 @@ pub fn op_zlib_write(
   Ok(zlib.err)
 }
 
-#[op]
+#[op2(fast)]
+#[smi]
 pub fn op_zlib_init(
-  state: &mut OpState,
-  handle: u32,
-  level: i32,
-  window_bits: i32,
-  mem_level: i32,
-  strategy: i32,
-  dictionary: &[u8],
-) -> Result<i32, AnyError> {
-  let resource = zlib(state, handle)?;
+  #[cppgc] resource: &Zlib,
+  #[smi] level: i32,
+  #[smi] window_bits: i32,
+  #[smi] mem_level: i32,
+  #[smi] strategy: i32,
+  #[buffer] dictionary: &[u8],
+) -> Result<i32, ZlibError> {
   let mut zlib = resource.inner.borrow_mut();
+  let zlib = zlib.as_mut().ok_or(ZlibError::NotInitialized)?;
 
   check((8..=15).contains(&window_bits), "invalid windowBits")?;
   check((-1..=9).contains(&level), "invalid level")?;
@@ -392,37 +363,42 @@ pub fn op_zlib_init(
 
 #[op2(fast)]
 #[smi]
-pub fn op_zlib_reset(
-  state: &mut OpState,
-  #[smi] handle: u32,
-) -> Result<i32, AnyError> {
-  let resource = zlib(state, handle)?;
-
+pub fn op_zlib_reset(#[cppgc] resource: &Zlib) -> Result<i32, ZlibError> {
   let mut zlib = resource.inner.borrow_mut();
-  zlib.reset_stream()?;
+  let zlib = zlib.as_mut().ok_or(ZlibError::NotInitialized)?;
+
+  zlib.reset_stream();
 
   Ok(zlib.err)
 }
 
 #[op2(fast)]
 pub fn op_zlib_close_if_pending(
-  state: &mut OpState,
-  #[smi] handle: u32,
-) -> Result<(), AnyError> {
-  let resource = zlib(state, handle)?;
+  #[cppgc] resource: &Zlib,
+) -> Result<(), ZlibError> {
   let pending_close = {
     let mut zlib = resource.inner.borrow_mut();
+    let zlib = zlib.as_mut().ok_or(ZlibError::NotInitialized)?;
+
     zlib.write_in_progress = false;
     zlib.pending_close
   };
   if pending_close {
-    drop(resource);
-    if let Ok(res) = state.resource_table.take_any(handle) {
-      res.close();
+    if let Some(mut res) = resource.inner.borrow_mut().take() {
+      let _ = res.close();
     }
   }
 
   Ok(())
+}
+
+#[op2(fast)]
+#[smi]
+pub fn op_zlib_crc32(#[buffer] data: &[u8], #[smi] value: u32) -> u32 {
+  // SAFETY: `data` is a valid buffer.
+  unsafe {
+    zlib::crc32(value as c_ulong, data.as_ptr(), data.len() as u32) as u32
+  }
 }
 
 #[cfg(test)]

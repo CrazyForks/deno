@@ -1,4 +1,4 @@
-// Copyright 2018-2023 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -494,6 +494,8 @@ export const errorMap = new Map<number, [string, string]>(
     ? codeToErrorDarwin
     : osType === "linux"
     ? codeToErrorLinux
+    : osType === "android"
+    ? codeToErrorLinux
     : osType === "freebsd"
     ? codeToErrorFreebsd
     : osType === "openbsd"
@@ -507,6 +509,8 @@ export const codeMap = new Map<string, number>(
     : osType === "darwin"
     ? errorToCodeDarwin
     : osType === "linux"
+    ? errorToCodeLinux
+    : osType === "android"
     ? errorToCodeLinux
     : osType === "freebsd"
     ? errorToCodeFreebsd
@@ -526,8 +530,18 @@ export function mapSysErrnoToUvErrno(sysErrno: number): number {
 
 export const UV_EAI_MEMORY = codeMap.get("EAI_MEMORY")!;
 export const UV_EBADF = codeMap.get("EBADF")!;
+export const UV_ECANCELED = codeMap.get("ECANCELED")!;
 export const UV_EEXIST = codeMap.get("EEXIST");
 export const UV_EINVAL = codeMap.get("EINVAL")!;
 export const UV_ENOENT = codeMap.get("ENOENT");
 export const UV_ENOTSOCK = codeMap.get("ENOTSOCK")!;
+export const UV_ETIMEDOUT = codeMap.get("ETIMEDOUT")!;
 export const UV_UNKNOWN = codeMap.get("UNKNOWN")!;
+
+export function errname(errno: number): string {
+  const err = errorMap.get(errno);
+  if (err) {
+    return err[0];
+  }
+  return `UNKNOWN (${errno})`;
+}

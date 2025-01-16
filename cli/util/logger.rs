@@ -1,50 +1,97 @@
-// Copyright 2018-2023 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 
 use std::io::Write;
 
-struct CliLogger(env_logger::Logger);
+use deno_telemetry::OtelConfig;
+use deno_telemetry::OtelConsoleConfig;
+
+use super::draw_thread::DrawThread;
+
+struct CliLogger {
+  otel_console_config: OtelConsoleConfig,
+  logger: env_logger::Logger,
+}
 
 impl CliLogger {
-  pub fn new(logger: env_logger::Logger) -> Self {
-    Self(logger)
+  pub fn new(
+    logger: env_logger::Logger,
+    otel_console_config: OtelConsoleConfig,
+  ) -> Self {
+    Self {
+      logger,
+      otel_console_config,
+    }
   }
 
   pub fn filter(&self) -> log::LevelFilter {
-    self.0.filter()
+    self.logger.filter()
   }
 }
 
 impl log::Log for CliLogger {
   fn enabled(&self, metadata: &log::Metadata) -> bool {
-    self.0.enabled(metadata)
+    self.logger.enabled(metadata)
   }
 
   fn log(&self, record: &log::Record) {
     if self.enabled(record.metadata()) {
-      self.0.log(record);
+      // it was considered to hold the draw thread's internal lock
+      // across logging, but if outputting to stderr blocks then that
+      // could potentially block other threads that access the draw
+      // thread's state
+      DrawThread::hide();
+
+      match self.otel_console_config {
+        OtelConsoleConfig::Ignore => {
+          self.logger.log(record);
+        }
+        OtelConsoleConfig::Capture => {
+          self.logger.log(record);
+          deno_telemetry::handle_log(record);
+        }
+        OtelConsoleConfig::Replace => {
+          deno_telemetry::handle_log(record);
+        }
+      }
+
+      DrawThread::show();
     }
   }
 
   fn flush(&self) {
-    self.0.flush();
+    self.logger.flush();
   }
 }
 
-pub fn init(maybe_level: Option<log::Level>) {
+pub fn init(maybe_level: Option<log::Level>, otel_config: Option<OtelConfig>) {
   let log_level = maybe_level.unwrap_or(log::Level::Info);
   let logger = env_logger::Builder::from_env(
-    env_logger::Env::default()
-      .default_filter_or(log_level.to_level_filter().to_string()),
+    env_logger::Env::new()
+      // Use `DENO_LOG` and `DENO_LOG_STYLE` instead of `RUST_` prefix
+      .filter_or("DENO_LOG", log_level.to_level_filter().to_string())
+      .write_style("DENO_LOG_STYLE"),
   )
   // https://github.com/denoland/deno/issues/6641
   .filter_module("rustyline", log::LevelFilter::Off)
   // wgpu crates (gfx_backend), have a lot of useless INFO and WARN logs
   .filter_module("wgpu", log::LevelFilter::Error)
   .filter_module("gfx", log::LevelFilter::Error)
+  .filter_module("globset", log::LevelFilter::Error)
   // used to make available the lsp_debug which is then filtered out at runtime
   // in the cli logger
   .filter_module("deno::lsp::performance", log::LevelFilter::Debug)
   .filter_module("rustls", log::LevelFilter::Off)
+  // swc_ecma_codegen's `srcmap!` macro emits error-level spans only on debug
+  // build:
+  // https://github.com/swc-project/swc/blob/74d6478be1eb8cdf1df096c360c159db64b64d8a/crates/swc_ecma_codegen/src/macros.rs#L112
+  // We suppress them here to avoid flooding our CI logs in integration tests.
+  .filter_module("swc_ecma_codegen", log::LevelFilter::Off)
+  .filter_module("swc_ecma_transforms_optimization", log::LevelFilter::Off)
+  .filter_module("swc_ecma_parser", log::LevelFilter::Error)
+  // Suppress span lifecycle logs since they are too verbose
+  .filter_module("tracing::span", log::LevelFilter::Off)
+  // for deno_compile, this is too verbose
+  .filter_module("editpe", log::LevelFilter::Error)
   .format(|buf, record| {
     let mut target = record.target().to_string();
     if let Some(line_no) = record.line() {
@@ -70,7 +117,12 @@ pub fn init(maybe_level: Option<log::Level>) {
   })
   .build();
 
-  let cli_logger = CliLogger::new(logger);
+  let cli_logger = CliLogger::new(
+    logger,
+    otel_config
+      .map(|c| c.console)
+      .unwrap_or(OtelConsoleConfig::Ignore),
+  );
   let max_level = cli_logger.filter();
   let r = log::set_boxed_logger(Box::new(cli_logger));
   if r.is_ok() {

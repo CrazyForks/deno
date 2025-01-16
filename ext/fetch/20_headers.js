@@ -1,4 +1,4 @@
-// Copyright 2018-2023 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 
 // @ts-check
 /// <reference path="../webidl/internal.d.ts" />
@@ -8,6 +8,25 @@
 /// <reference path="../web/06_streams_types.d.ts" />
 /// <reference path="./lib.deno_fetch.d.ts" />
 /// <reference lib="esnext" />
+
+import { primordials } from "ext:core/mod.js";
+const {
+  ArrayIsArray,
+  ArrayPrototypePush,
+  ArrayPrototypeSort,
+  ArrayPrototypeJoin,
+  ArrayPrototypeSplice,
+  ObjectFromEntries,
+  ObjectHasOwn,
+  ObjectPrototypeIsPrototypeOf,
+  RegExpPrototypeTest,
+  Symbol,
+  SymbolFor,
+  SymbolIterator,
+  StringPrototypeReplaceAll,
+  StringPrototypeCharCodeAt,
+  TypeError,
+} = primordials;
 
 import * as webidl from "ext:deno_webidl/00_webidl.js";
 import {
@@ -19,22 +38,6 @@ import {
   HTTP_TOKEN_CODE_POINT_RE,
   httpTrim,
 } from "ext:deno_web/00_infra.js";
-const primordials = globalThis.__bootstrap.primordials;
-const {
-  ArrayIsArray,
-  ArrayPrototypePush,
-  ArrayPrototypeSort,
-  ArrayPrototypeJoin,
-  ArrayPrototypeSplice,
-  ObjectHasOwn,
-  RegExpPrototypeTest,
-  Symbol,
-  SymbolFor,
-  SymbolIterator,
-  StringPrototypeReplaceAll,
-  StringPrototypeCharCodeAt,
-  TypeError,
-} = primordials;
 
 const _headerList = Symbol("header list");
 const _iterableHeaders = Symbol("iterable headers");
@@ -70,7 +73,7 @@ function fillHeaders(headers, object) {
       const header = object[i];
       if (header.length !== 2) {
         throw new TypeError(
-          `Invalid header. Length must be 2, but is ${header.length}`,
+          `Invalid header: length must be 2, but is ${header.length}`,
         );
       }
       appendHeader(headers, header[0], header[1]);
@@ -97,7 +100,7 @@ function checkForInvalidValueChars(value) {
   return true;
 }
 
-let HEADER_NAME_CACHE = {};
+let HEADER_NAME_CACHE = { __proto__: null };
 let HEADER_CACHE_SIZE = 0;
 const HEADER_NAME_CACHE_SIZE_BOUNDARY = 4096;
 function checkHeaderNameForHttpTokenCodePoint(name) {
@@ -109,7 +112,7 @@ function checkHeaderNameForHttpTokenCodePoint(name) {
   const valid = RegExpPrototypeTest(HTTP_TOKEN_CODE_POINT_RE, name);
 
   if (HEADER_CACHE_SIZE > HEADER_NAME_CACHE_SIZE_BOUNDARY) {
-    HEADER_NAME_CACHE = {};
+    HEADER_NAME_CACHE = { __proto__: null };
     HEADER_CACHE_SIZE = 0;
   }
   HEADER_CACHE_SIZE++;
@@ -130,15 +133,15 @@ function appendHeader(headers, name, value) {
 
   // 2.
   if (!checkHeaderNameForHttpTokenCodePoint(name)) {
-    throw new TypeError("Header name is not valid.");
+    throw new TypeError(`Invalid header name: "${name}"`);
   }
   if (!checkForInvalidValueChars(value)) {
-    throw new TypeError("Header value is not valid.");
+    throw new TypeError(`Invalid header value: "${value}"`);
   }
 
   // 3.
   if (headers[_guard] == "immutable") {
-    throw new TypeError("Headers are immutable.");
+    throw new TypeError("Cannot change header: headers are immutable");
   }
 
   // 7.
@@ -238,7 +241,7 @@ class Headers {
 
     // The order of steps are not similar to the ones suggested by the
     // spec but produce the same result.
-    const seenHeaders = {};
+    const seenHeaders = { __proto__: null };
     const entries = [];
     for (let i = 0; i < list.length; ++i) {
       const entry = list[i];
@@ -327,10 +330,10 @@ class Headers {
     name = webidl.converters["ByteString"](name, prefix, "Argument 1");
 
     if (!checkHeaderNameForHttpTokenCodePoint(name)) {
-      throw new TypeError("Header name is not valid.");
+      throw new TypeError(`Invalid header name: "${name}"`);
     }
     if (this[_guard] == "immutable") {
-      throw new TypeError("Headers are immutable.");
+      throw new TypeError("Cannot change headers: headers are immutable");
     }
 
     const list = this[_headerList];
@@ -353,7 +356,7 @@ class Headers {
     name = webidl.converters["ByteString"](name, prefix, "Argument 1");
 
     if (!checkHeaderNameForHttpTokenCodePoint(name)) {
-      throw new TypeError("Header name is not valid.");
+      throw new TypeError(`Invalid header name: "${name}"`);
     }
 
     const list = this[_headerList];
@@ -384,7 +387,7 @@ class Headers {
     name = webidl.converters["ByteString"](name, prefix, "Argument 1");
 
     if (!checkHeaderNameForHttpTokenCodePoint(name)) {
-      throw new TypeError("Header name is not valid.");
+      throw new TypeError(`Invalid header name: "${name}"`);
     }
 
     const list = this[_headerList];
@@ -412,14 +415,14 @@ class Headers {
 
     // 2.
     if (!checkHeaderNameForHttpTokenCodePoint(name)) {
-      throw new TypeError("Header name is not valid.");
+      throw new TypeError(`Invalid header name: "${name}"`);
     }
     if (!checkForInvalidValueChars(value)) {
-      throw new TypeError("Header value is not valid.");
+      throw new TypeError(`Invalid header value: "${value}"`);
     }
 
     if (this[_guard] == "immutable") {
-      throw new TypeError("Headers are immutable.");
+      throw new TypeError("Cannot change headers: headers are immutable");
     }
 
     const list = this[_headerList];
@@ -441,19 +444,20 @@ class Headers {
     }
   }
 
-  [SymbolFor("Deno.privateCustomInspect")](inspect) {
-    const headers = {};
-    // deno-lint-ignore prefer-primordials
-    for (const header of this) {
-      headers[header[0]] = header[1];
+  [SymbolFor("Deno.privateCustomInspect")](inspect, inspectOptions) {
+    if (ObjectPrototypeIsPrototypeOf(HeadersPrototype, this)) {
+      return `${this.constructor.name} ${
+        inspect(ObjectFromEntries(this), inspectOptions)
+      }`;
+    } else {
+      return `${this.constructor.name} ${inspect({}, inspectOptions)}`;
     }
-    return `Headers ${inspect(headers)}`;
   }
 }
 
 webidl.mixinPairIterable("Headers", Headers, _iterableHeaders, 0, 1);
 
-webidl.configurePrototype(Headers);
+webidl.configureInterface(Headers);
 const HeadersPrototype = Headers.prototype;
 
 webidl.converters["HeadersInit"] = (V, prefix, context, opts) => {

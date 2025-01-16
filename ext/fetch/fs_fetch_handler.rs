@@ -1,18 +1,21 @@
-// Copyright 2018-2023 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
+
+use std::rc::Rc;
+
+use deno_core::futures::FutureExt;
+use deno_core::futures::TryFutureExt;
+use deno_core::futures::TryStreamExt;
+use deno_core::url::Url;
+use deno_core::CancelFuture;
+use deno_core::OpState;
+use deno_error::JsErrorBox;
+use http::StatusCode;
+use http_body_util::BodyExt;
+use tokio_util::io::ReaderStream;
 
 use crate::CancelHandle;
 use crate::CancelableResponseFuture;
 use crate::FetchHandler;
-
-use deno_core::error::type_error;
-use deno_core::futures::FutureExt;
-use deno_core::futures::TryFutureExt;
-use deno_core::url::Url;
-use deno_core::CancelFuture;
-use deno_core::OpState;
-use reqwest::StatusCode;
-use std::rc::Rc;
-use tokio_util::io::ReaderStream;
 
 /// An implementation which tries to read file URLs from the file system via
 /// tokio::fs.
@@ -23,24 +26,24 @@ impl FetchHandler for FsFetchHandler {
   fn fetch_file(
     &self,
     _state: &mut OpState,
-    url: Url,
+    url: &Url,
   ) -> (CancelableResponseFuture, Option<Rc<CancelHandle>>) {
     let cancel_handle = CancelHandle::new_rc();
+    let path_result = url.to_file_path();
     let response_fut = async move {
-      let path = url.to_file_path()?;
+      let path = path_result?;
       let file = tokio::fs::File::open(path).map_err(|_| ()).await?;
-      let stream = ReaderStream::new(file);
-      let body = reqwest::Body::wrap_stream(stream);
+      let stream = ReaderStream::new(file)
+        .map_ok(hyper::body::Frame::data)
+        .map_err(JsErrorBox::from_err);
+      let body = http_body_util::StreamBody::new(stream).boxed();
       let response = http::Response::builder()
         .status(StatusCode::OK)
         .body(body)
-        .map_err(|_| ())?
-        .into();
+        .map_err(|_| ())?;
       Ok::<_, ()>(response)
     }
-    .map_err(move |_| {
-      type_error("NetworkError when attempting to fetch resource.")
-    })
+    .map_err(move |_| super::FetchError::NetworkError)
     .or_cancel(&cancel_handle)
     .boxed_local();
 

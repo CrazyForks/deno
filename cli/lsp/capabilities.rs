@@ -1,4 +1,4 @@
-// Copyright 2018-2023 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 
 //!
 //! Provides information about what capabilities that are supported by the
@@ -39,7 +39,6 @@ fn code_action_capabilities(
 
 pub fn server_capabilities(
   client_capabilities: &ClientCapabilities,
-  enable_builtin_commands: bool,
 ) -> ServerCapabilities {
   let code_action_provider = code_action_capabilities(client_capabilities);
   ServerCapabilities {
@@ -120,11 +119,10 @@ pub fn server_capabilities(
     document_link_provider: None,
     color_provider: None,
     execute_command_provider: Some(ExecuteCommandOptions {
-      commands: if enable_builtin_commands {
-        vec!["deno.cache".into()]
-      } else {
-        vec![]
-      },
+      commands: vec![
+        "deno.cache".to_string(),
+        "deno.reloadImportRegistries".to_string(),
+      ],
       ..Default::default()
     }),
     call_hierarchy_provider: Some(CallHierarchyServerCapability::Simple(true)),
@@ -149,9 +147,14 @@ pub fn server_capabilities(
     moniker_provider: None,
     experimental: Some(json!({
       "denoConfigTasks": true,
-      "testingApi":true,
+      "testingApi": true,
+      "didRefreshDenoConfigurationTreeNotifications": true,
     })),
     inlay_hint_provider: Some(OneOf::Left(true)),
     position_encoding: None,
+    diagnostic_provider: None,
+    inline_value_provider: None,
+    inline_completion_provider: None,
+    notebook_document_sync: None,
   }
 }

@@ -1,21 +1,22 @@
-// Copyright 2018-2023 the Deno authors. All rights reserved. MIT license.
-use deno_core::error::AnyError;
+// Copyright 2018-2025 the Deno authors. MIT license.
+use std::borrow::Cow;
+use std::net::Ipv4Addr;
+use std::net::SocketAddr;
+use std::net::SocketAddrV4;
+use std::rc::Rc;
+
 use deno_core::OpState;
 use deno_core::ResourceId;
+use deno_error::JsErrorBox;
 use deno_net::raw::take_network_stream_listener_resource;
 use deno_net::raw::take_network_stream_resource;
 use deno_net::raw::NetworkStream;
 use deno_net::raw::NetworkStreamAddress;
 use deno_net::raw::NetworkStreamListener;
 use deno_net::raw::NetworkStreamType;
+use hyper::header::HOST;
 use hyper::HeaderMap;
 use hyper::Uri;
-use hyper1::header::HOST;
-use std::borrow::Cow;
-use std::net::Ipv4Addr;
-use std::net::SocketAddr;
-use std::net::SocketAddrV4;
-use std::rc::Rc;
 
 // TODO(mmastrac): I don't like that we have to clone this, but it's one-time setup
 #[derive(Clone)]
@@ -34,8 +35,8 @@ pub struct HttpConnectionProperties {
   pub stream_type: NetworkStreamType,
 }
 
-pub struct HttpRequestProperties {
-  pub authority: Option<String>,
+pub struct HttpRequestProperties<'a> {
+  pub authority: Option<Cow<'a, str>>,
 }
 
 /// Pluggable trait to determine listen, connection and request properties
@@ -49,13 +50,13 @@ pub trait HttpPropertyExtractor {
   fn get_listener_for_rid(
     state: &mut OpState,
     listener_rid: ResourceId,
-  ) -> Result<Self::Listener, AnyError>;
+  ) -> Result<Self::Listener, JsErrorBox>;
 
   /// Given a connection [`ResourceId`], returns the [`HttpPropertyExtractor::Connection`].
   fn get_connection_for_rid(
     state: &mut OpState,
     connection_rid: ResourceId,
-  ) -> Result<Self::Connection, AnyError>;
+  ) -> Result<Self::Connection, JsErrorBox>;
 
   /// Determines the listener properties.
   fn listen_properties_from_listener(
@@ -70,7 +71,7 @@ pub trait HttpPropertyExtractor {
   /// Accept a new [`HttpPropertyExtractor::Connection`] from the given listener [`HttpPropertyExtractor::Listener`].
   async fn accept_connection_from_listener(
     listener: &Self::Listener,
-  ) -> Result<Self::Connection, AnyError>;
+  ) -> Result<Self::Connection, JsErrorBox>;
 
   /// Determines the connection properties.
   fn connection_properties(
@@ -84,11 +85,11 @@ pub trait HttpPropertyExtractor {
   ) -> NetworkStream;
 
   /// Determines the request properties.
-  fn request_properties(
-    connection_properties: &HttpConnectionProperties,
-    uri: &Uri,
-    headers: &HeaderMap,
-  ) -> HttpRequestProperties;
+  fn request_properties<'a>(
+    connection_properties: &'a HttpConnectionProperties,
+    uri: &'a Uri,
+    headers: &'a HeaderMap,
+  ) -> HttpRequestProperties<'a>;
 }
 
 pub struct DefaultHttpPropertyExtractor {}
@@ -102,7 +103,7 @@ impl HttpPropertyExtractor for DefaultHttpPropertyExtractor {
   fn get_listener_for_rid(
     state: &mut OpState,
     listener_rid: ResourceId,
-  ) -> Result<NetworkStreamListener, AnyError> {
+  ) -> Result<NetworkStreamListener, JsErrorBox> {
     take_network_stream_listener_resource(
       &mut state.resource_table,
       listener_rid,
@@ -112,14 +113,19 @@ impl HttpPropertyExtractor for DefaultHttpPropertyExtractor {
   fn get_connection_for_rid(
     state: &mut OpState,
     stream_rid: ResourceId,
-  ) -> Result<NetworkStream, AnyError> {
+  ) -> Result<NetworkStream, JsErrorBox> {
     take_network_stream_resource(&mut state.resource_table, stream_rid)
+      .map_err(JsErrorBox::from_err)
   }
 
   async fn accept_connection_from_listener(
     listener: &NetworkStreamListener,
-  ) -> Result<NetworkStream, AnyError> {
-    listener.accept().await.map_err(Into::into)
+  ) -> Result<NetworkStream, JsErrorBox> {
+    listener
+      .accept()
+      .await
+      .map_err(JsErrorBox::from_err)
+      .map(|(stm, _)| stm)
   }
 
   fn listen_properties_from_listener(
@@ -176,18 +182,17 @@ impl HttpPropertyExtractor for DefaultHttpPropertyExtractor {
     }
   }
 
-  fn request_properties(
-    connection_properties: &HttpConnectionProperties,
-    uri: &Uri,
-    headers: &HeaderMap,
-  ) -> HttpRequestProperties {
+  fn request_properties<'a>(
+    connection_properties: &'a HttpConnectionProperties,
+    uri: &'a Uri,
+    headers: &'a HeaderMap,
+  ) -> HttpRequestProperties<'a> {
     let authority = req_host(
       uri,
       headers,
       connection_properties.stream_type,
       connection_properties.local_port.unwrap_or_default(),
-    )
-    .map(|s| s.into_owned());
+    );
 
     HttpRequestProperties { authority }
   }

@@ -1,27 +1,33 @@
-// Copyright 2018-2023 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 
-// TODO(petamoriken): enable prefer-primordials for node polyfills
-// deno-lint-ignore-file prefer-primordials
-
-const primordials = globalThis.__bootstrap.primordials;
+import { primordials } from "ext:core/mod.js";
 const {
   MapPrototypeGet,
   MapPrototypeDelete,
+  ObjectDefineProperty,
+  Promise,
+  SafeArrayIterator,
 } = primordials;
 
 import {
   activeTimers,
+  Immediate,
   setUnrefTimeout,
   Timeout,
 } from "ext:deno_node/internal/timers.mjs";
-import { validateFunction } from "ext:deno_node/internal/validators.mjs";
+import {
+  validateAbortSignal,
+  validateBoolean,
+  validateFunction,
+  validateObject,
+} from "ext:deno_node/internal/validators.mjs";
 import { promisify } from "ext:deno_node/internal/util.mjs";
 export { setUnrefTimeout } from "ext:deno_node/internal/timers.mjs";
 import * as timers from "ext:deno_web/02_timers.js";
+import { AbortError } from "ext:deno_node/internal/errors.ts";
 
 const clearTimeout_ = timers.clearTimeout;
 const clearInterval_ = timers.clearInterval;
-const setTimeoutUnclamped = timers.setTimeoutUnclamped;
 
 export function setTimeout(
   callback: (...args: unknown[]) => void,
@@ -32,9 +38,12 @@ export function setTimeout(
   return new Timeout(callback, timeout, args, false, true);
 }
 
-Object.defineProperty(setTimeout, promisify.custom, {
+ObjectDefineProperty(setTimeout, promisify.custom, {
+  __proto__: null,
   value: (timeout: number, ...args: unknown[]) => {
-    return new Promise((cb) => setTimeout(cb, timeout, ...args));
+    return new Promise((cb) =>
+      setTimeout(cb, timeout, ...new SafeArrayIterator(args))
+    );
   },
   enumerable: true,
 });
@@ -45,7 +54,7 @@ export function clearTimeout(timeout?: Timeout | number) {
   const id = +timeout;
   const timer = MapPrototypeGet(activeTimers, id);
   if (timer) {
-    timeout._destroyed = true;
+    timer._destroyed = true;
     MapPrototypeDelete(activeTimers, id);
   }
   clearTimeout_(id);
@@ -65,20 +74,120 @@ export function clearInterval(timeout?: Timeout | number | string) {
   const id = +timeout;
   const timer = MapPrototypeGet(activeTimers, id);
   if (timer) {
-    timeout._destroyed = true;
+    timer._destroyed = true;
     MapPrototypeDelete(activeTimers, id);
   }
   clearInterval_(id);
 }
-// TODO(bartlomieju): implement the 'NodeJS.Immediate' versions of the timers.
-// https://github.com/DefinitelyTyped/DefinitelyTyped/blob/1163ead296d84e7a3c80d71e7c81ecbd1a130e9a/types/node/v12/globals.d.ts#L1120-L1131
 export function setImmediate(
   cb: (...args: unknown[]) => void,
   ...args: unknown[]
 ): Timeout {
-  return setTimeoutUnclamped(cb, 0, ...args);
+  return new Immediate(cb, ...new SafeArrayIterator(args));
 }
-export const clearImmediate = clearTimeout;
+export function clearImmediate(immediate: Immediate) {
+  if (immediate == null) {
+    return;
+  }
+
+  // FIXME(nathanwhit): will probably change once
+  //  deno_core has proper support for immediates
+  clearTimeout_(immediate._immediateId);
+}
+
+async function* setIntervalAsync(
+  after: number,
+  value: number,
+  options: { signal?: AbortSignal; ref?: boolean } = { __proto__: null },
+) {
+  validateObject(options, "options");
+
+  if (typeof options?.signal !== "undefined") {
+    validateAbortSignal(options.signal, "options.signal");
+  }
+
+  if (typeof options?.ref !== "undefined") {
+    validateBoolean(options.ref, "options.ref");
+  }
+
+  const { signal, ref = true } = options;
+
+  if (signal?.aborted) {
+    throw new AbortError(undefined, { cause: signal?.reason });
+  }
+
+  let onCancel: (() => void) | undefined = undefined;
+  let interval: Timeout | undefined = undefined;
+  try {
+    let notYielded = 0;
+    let callback: ((value?: object) => void) | undefined = undefined;
+    let rejectCallback: ((message?: string) => void) | undefined = undefined;
+    interval = new Timeout(
+      () => {
+        notYielded++;
+        if (callback) {
+          callback();
+          callback = undefined;
+          rejectCallback = undefined;
+        }
+      },
+      after,
+      [],
+      true,
+      ref,
+    );
+    if (signal) {
+      onCancel = () => {
+        clearInterval(interval);
+        if (rejectCallback) {
+          rejectCallback(signal.reason);
+          callback = undefined;
+          rejectCallback = undefined;
+        }
+      };
+      signal.addEventListener("abort", onCancel, { once: true });
+    }
+    while (!signal?.aborted) {
+      if (notYielded === 0) {
+        await new Promise((resolve: () => void, reject: () => void) => {
+          callback = resolve;
+          rejectCallback = reject;
+        });
+      }
+      for (; notYielded > 0; notYielded--) {
+        yield value;
+      }
+    }
+  } catch (error) {
+    if (signal?.aborted) {
+      throw new AbortError(undefined, { cause: signal?.reason });
+    }
+    throw error;
+  } finally {
+    if (interval) {
+      clearInterval(interval);
+    }
+    if (onCancel) {
+      signal?.removeEventListener("abort", onCancel);
+    }
+  }
+}
+
+export const promises = {
+  setTimeout: promisify(setTimeout),
+  setImmediate: promisify(setImmediate),
+  setInterval: setIntervalAsync,
+};
+
+promises.scheduler = {
+  async wait(
+    delay: number,
+    options?: { signal?: AbortSignal },
+  ): Promise<void> {
+    return await promises.setTimeout(delay, undefined, options);
+  },
+  yield: promises.setImmediate,
+};
 
 export default {
   setTimeout,
@@ -88,4 +197,5 @@ export default {
   setImmediate,
   setUnrefTimeout,
   clearImmediate,
+  promises,
 };

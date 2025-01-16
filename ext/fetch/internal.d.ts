@@ -1,4 +1,4 @@
-// Copyright 2018-2023 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 
 // deno-lint-ignore-file no-explicit-any no-var
 
@@ -70,7 +70,6 @@ declare module "ext:deno_fetch/26_fetch.js" {
   function toInnerRequest(request: Request): InnerRequest;
   function fromInnerRequest(
     inner: InnerRequest,
-    signal: AbortSignal | null,
     guard:
       | "request"
       | "immutable"

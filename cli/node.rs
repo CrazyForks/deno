@@ -1,106 +1,188 @@
-// Copyright 2018-2023 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 
 use std::borrow::Cow;
+use std::sync::Arc;
 
-use deno_ast::CjsAnalysis;
 use deno_ast::MediaType;
 use deno_ast::ModuleSpecifier;
 use deno_core::error::AnyError;
+use deno_graph::ParsedSourceStore;
+use deno_resolver::npm::DenoInNpmPackageChecker;
 use deno_runtime::deno_fs;
-use deno_runtime::deno_node::analyze::CjsAnalysis as ExtNodeCjsAnalysis;
-use deno_runtime::deno_node::analyze::CjsCodeAnalyzer;
-use deno_runtime::deno_node::analyze::NodeCodeTranslator;
+use deno_runtime::deno_node::RealIsBuiltInNodeModuleChecker;
+use node_resolver::analyze::CjsAnalysis as ExtNodeCjsAnalysis;
+use node_resolver::analyze::CjsAnalysisExports;
+use node_resolver::analyze::CjsCodeAnalyzer;
+use node_resolver::analyze::NodeCodeTranslator;
+use serde::Deserialize;
+use serde::Serialize;
 
+use crate::cache::CacheDBHash;
 use crate::cache::NodeAnalysisCache;
-use crate::util::fs::canonicalize_path_maybe_not_exists;
+use crate::cache::ParsedSourceCache;
+use crate::npm::CliNpmResolver;
+use crate::resolver::CliCjsTracker;
+use crate::sys::CliSys;
 
-pub type CliNodeCodeTranslator = NodeCodeTranslator<CliCjsCodeAnalyzer>;
+pub type CliNodeCodeTranslator = NodeCodeTranslator<
+  CliCjsCodeAnalyzer,
+  DenoInNpmPackageChecker,
+  RealIsBuiltInNodeModuleChecker,
+  CliNpmResolver,
+  CliSys,
+>;
+pub type CliNodeResolver = deno_runtime::deno_node::NodeResolver<
+  DenoInNpmPackageChecker,
+  CliNpmResolver,
+  CliSys,
+>;
+pub type CliPackageJsonResolver = node_resolver::PackageJsonResolver<CliSys>;
 
-/// Resolves a specifier that is pointing into a node_modules folder.
-///
-/// Note: This should be called whenever getting the specifier from
-/// a Module::External(module) reference because that module might
-/// not be fully resolved at the time deno_graph is analyzing it
-/// because the node_modules folder might not exist at that time.
-pub fn resolve_specifier_into_node_modules(
-  specifier: &ModuleSpecifier,
-) -> ModuleSpecifier {
-  specifier
-    .to_file_path()
-    .ok()
-    // this path might not exist at the time the graph is being created
-    // because the node_modules folder might not yet exist
-    .and_then(|path| canonicalize_path_maybe_not_exists(&path).ok())
-    .and_then(|path| ModuleSpecifier::from_file_path(path).ok())
-    .unwrap_or_else(|| specifier.clone())
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CliCjsAnalysis {
+  /// The module was found to be an ES module.
+  Esm,
+  /// The module was CJS.
+  Cjs {
+    exports: Vec<String>,
+    reexports: Vec<String>,
+  },
 }
 
 pub struct CliCjsCodeAnalyzer {
   cache: NodeAnalysisCache,
+  cjs_tracker: Arc<CliCjsTracker>,
   fs: deno_fs::FileSystemRc,
+  parsed_source_cache: Option<Arc<ParsedSourceCache>>,
 }
 
 impl CliCjsCodeAnalyzer {
-  pub fn new(cache: NodeAnalysisCache, fs: deno_fs::FileSystemRc) -> Self {
-    Self { cache, fs }
+  pub fn new(
+    cache: NodeAnalysisCache,
+    cjs_tracker: Arc<CliCjsTracker>,
+    fs: deno_fs::FileSystemRc,
+    parsed_source_cache: Option<Arc<ParsedSourceCache>>,
+  ) -> Self {
+    Self {
+      cache,
+      cjs_tracker,
+      fs,
+      parsed_source_cache,
+    }
   }
 
-  fn inner_cjs_analysis(
+  async fn inner_cjs_analysis(
     &self,
     specifier: &ModuleSpecifier,
     source: &str,
-  ) -> Result<CjsAnalysis, AnyError> {
-    let source_hash = NodeAnalysisCache::compute_source_hash(source);
-    if let Some(analysis) = self
-      .cache
-      .get_cjs_analysis(specifier.as_str(), &source_hash)
+  ) -> Result<CliCjsAnalysis, AnyError> {
+    let source_hash = CacheDBHash::from_hashable(source);
+    if let Some(analysis) =
+      self.cache.get_cjs_analysis(specifier.as_str(), source_hash)
     {
       return Ok(analysis);
     }
 
     let media_type = MediaType::from_specifier(specifier);
     if media_type == MediaType::Json {
-      return Ok(CjsAnalysis {
+      return Ok(CliCjsAnalysis::Cjs {
         exports: vec![],
         reexports: vec![],
       });
     }
 
-    let parsed_source = deno_ast::parse_script(deno_ast::ParseParams {
-      specifier: specifier.to_string(),
-      text_info: deno_ast::SourceTextInfo::new(source.into()),
-      media_type,
-      capture_tokens: true,
-      scope_analysis: false,
-      maybe_syntax: None,
-    })?;
-    let analysis = parsed_source.analyze_cjs();
+    let cjs_tracker = self.cjs_tracker.clone();
+    let is_maybe_cjs = cjs_tracker.is_maybe_cjs(specifier, media_type)?;
+    let analysis = if is_maybe_cjs {
+      let maybe_parsed_source = self
+        .parsed_source_cache
+        .as_ref()
+        .and_then(|c| c.remove_parsed_source(specifier));
+
+      deno_core::unsync::spawn_blocking({
+        let specifier = specifier.clone();
+        let source: Arc<str> = source.into();
+        move || -> Result<_, AnyError> {
+          let parsed_source =
+            maybe_parsed_source.map(Ok).unwrap_or_else(|| {
+              deno_ast::parse_program(deno_ast::ParseParams {
+                specifier,
+                text: source,
+                media_type,
+                capture_tokens: true,
+                scope_analysis: false,
+                maybe_syntax: None,
+              })
+            })?;
+          let is_script = parsed_source.compute_is_script();
+          let is_cjs = cjs_tracker.is_cjs_with_known_is_script(
+            parsed_source.specifier(),
+            media_type,
+            is_script,
+          )?;
+          if is_cjs {
+            let analysis = parsed_source.analyze_cjs();
+            Ok(CliCjsAnalysis::Cjs {
+              exports: analysis.exports,
+              reexports: analysis.reexports,
+            })
+          } else {
+            Ok(CliCjsAnalysis::Esm)
+          }
+        }
+      })
+      .await
+      .unwrap()?
+    } else {
+      CliCjsAnalysis::Esm
+    };
+
     self
       .cache
-      .set_cjs_analysis(specifier.as_str(), &source_hash, &analysis);
+      .set_cjs_analysis(specifier.as_str(), source_hash, &analysis);
 
     Ok(analysis)
   }
 }
 
+#[async_trait::async_trait(?Send)]
 impl CjsCodeAnalyzer for CliCjsCodeAnalyzer {
-  fn analyze_cjs(
+  async fn analyze_cjs<'a>(
     &self,
     specifier: &ModuleSpecifier,
-    source: Option<&str>,
-  ) -> Result<ExtNodeCjsAnalysis, AnyError> {
+    source: Option<Cow<'a, str>>,
+  ) -> Result<ExtNodeCjsAnalysis<'a>, AnyError> {
     let source = match source {
-      Some(source) => Cow::Borrowed(source),
-      None => Cow::Owned(
-        self
-          .fs
-          .read_text_file_sync(&specifier.to_file_path().unwrap())?,
-      ),
+      Some(source) => source,
+      None => {
+        if let Ok(path) = specifier.to_file_path() {
+          if let Ok(source_from_file) =
+            self.fs.read_text_file_lossy_async(path, None).await
+          {
+            source_from_file
+          } else {
+            return Ok(ExtNodeCjsAnalysis::Cjs(CjsAnalysisExports {
+              exports: vec![],
+              reexports: vec![],
+            }));
+          }
+        } else {
+          return Ok(ExtNodeCjsAnalysis::Cjs(CjsAnalysisExports {
+            exports: vec![],
+            reexports: vec![],
+          }));
+        }
+      }
     };
-    let analysis = self.inner_cjs_analysis(specifier, &source)?;
-    Ok(ExtNodeCjsAnalysis {
-      exports: analysis.exports,
-      reexports: analysis.reexports,
-    })
+    let analysis = self.inner_cjs_analysis(specifier, &source).await?;
+    match analysis {
+      CliCjsAnalysis::Esm => Ok(ExtNodeCjsAnalysis::Esm(source)),
+      CliCjsAnalysis::Cjs { exports, reexports } => {
+        Ok(ExtNodeCjsAnalysis::Cjs(CjsAnalysisExports {
+          exports,
+          reexports,
+        }))
+      }
+    }
   }
 }

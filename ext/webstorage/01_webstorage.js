@@ -1,134 +1,82 @@
-// Copyright 2018-2023 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 
 /// <reference path="../../core/internal.d.ts" />
 
-const core = globalThis.Deno.core;
-const ops = core.ops;
-import * as webidl from "ext:deno_webidl/00_webidl.js";
-const primordials = globalThis.__bootstrap.primordials;
+import { primordials } from "ext:core/mod.js";
+import { op_webstorage_iterate_keys, Storage } from "ext:core/ops";
 const {
-  SafeArrayIterator,
-  Symbol,
   SymbolFor,
-  ObjectDefineProperty,
   ObjectFromEntries,
   ObjectEntries,
-  ReflectGet,
+  ReflectDefineProperty,
+  ReflectDeleteProperty,
+  FunctionPrototypeBind,
   ReflectHas,
   Proxy,
 } = primordials;
 
-const _persistent = Symbol("[[persistent]]");
-
-class Storage {
-  [_persistent];
-
-  constructor() {
-    webidl.illegalConstructor();
-  }
-
-  get length() {
-    webidl.assertBranded(this, StoragePrototype);
-    return ops.op_webstorage_length(this[_persistent]);
-  }
-
-  key(index) {
-    webidl.assertBranded(this, StoragePrototype);
-    const prefix = "Failed to execute 'key' on 'Storage'";
-    webidl.requiredArguments(arguments.length, 1, prefix);
-    index = webidl.converters["unsigned long"](index, prefix, "Argument 1");
-
-    return ops.op_webstorage_key(index, this[_persistent]);
-  }
-
-  setItem(key, value) {
-    webidl.assertBranded(this, StoragePrototype);
-    const prefix = "Failed to execute 'setItem' on 'Storage'";
-    webidl.requiredArguments(arguments.length, 2, prefix);
-    key = webidl.converters.DOMString(key, prefix, "Argument 1");
-    value = webidl.converters.DOMString(value, prefix, "Argument 2");
-
-    ops.op_webstorage_set(key, value, this[_persistent]);
-  }
-
-  getItem(key) {
-    webidl.assertBranded(this, StoragePrototype);
-    const prefix = "Failed to execute 'getItem' on 'Storage'";
-    webidl.requiredArguments(arguments.length, 1, prefix);
-    key = webidl.converters.DOMString(key, prefix, "Argument 1");
-
-    return ops.op_webstorage_get(key, this[_persistent]);
-  }
-
-  removeItem(key) {
-    webidl.assertBranded(this, StoragePrototype);
-    const prefix = "Failed to execute 'removeItem' on 'Storage'";
-    webidl.requiredArguments(arguments.length, 1, prefix);
-    key = webidl.converters.DOMString(key, prefix, "Argument 1");
-
-    ops.op_webstorage_remove(key, this[_persistent]);
-  }
-
-  clear() {
-    webidl.assertBranded(this, StoragePrototype);
-    ops.op_webstorage_clear(this[_persistent]);
-  }
-}
-
-const StoragePrototype = Storage.prototype;
-
 function createStorage(persistent) {
-  const storage = webidl.createBranded(Storage);
-  storage[_persistent] = persistent;
+  const storage = new Storage(persistent);
 
   const proxy = new Proxy(storage, {
     deleteProperty(target, key) {
-      if (typeof key == "symbol") {
-        delete target[key];
-      } else {
-        target.removeItem(key);
+      if (typeof key === "symbol") {
+        return ReflectDeleteProperty(target, key);
       }
+      target.removeItem(key);
       return true;
     },
+
     defineProperty(target, key, descriptor) {
-      if (typeof key == "symbol") {
-        ObjectDefineProperty(target, key, descriptor);
-      } else {
-        target.setItem(key, descriptor.value);
+      if (typeof key === "symbol") {
+        return ReflectDefineProperty(target, key, descriptor);
       }
+      target.setItem(key, descriptor.value);
       return true;
     },
+
     get(target, key) {
-      if (typeof key == "symbol") return target[key];
-      if (ReflectHas(target, key)) {
-        return ReflectGet(...new SafeArrayIterator(arguments));
-      } else {
-        return target.getItem(key) ?? undefined;
+      if (typeof key === "symbol") {
+        return target[key];
       }
+      if (ReflectHas(target, key)) {
+        const value = target[key];
+        if (typeof value === "function") {
+          return FunctionPrototypeBind(value, target);
+        }
+        return value;
+      }
+      return target.getItem(key) ?? undefined;
     },
+
     set(target, key, value) {
-      if (typeof key == "symbol") {
-        ObjectDefineProperty(target, key, {
+      if (typeof key === "symbol") {
+        return ReflectDefineProperty(target, key, {
+          __proto__: null,
           value,
           configurable: true,
         });
-      } else {
-        target.setItem(key, value);
       }
+      target.setItem(key, value);
       return true;
     },
-    has(target, p) {
-      return p === SymbolFor("Deno.customInspect") ||
-        (typeof target.getItem(p)) === "string";
+
+    has(target, key) {
+      if (ReflectHas(target, key)) {
+        return true;
+      }
+      return typeof key === "string" && typeof target.getItem(key) === "string";
     },
+
     ownKeys() {
-      return ops.op_webstorage_iterate_keys(persistent);
+      return op_webstorage_iterate_keys(storage);
     },
+
     getOwnPropertyDescriptor(target, key) {
-      if (arguments.length === 1) {
+      if (ReflectHas(target, key)) {
         return undefined;
       }
-      if (ReflectHas(target, key)) {
+      if (typeof key === "symbol") {
         return undefined;
       }
       const value = target.getItem(key);
@@ -144,12 +92,15 @@ function createStorage(persistent) {
     },
   });
 
-  proxy[SymbolFor("Deno.customInspect")] = function (inspect) {
-    return `${this.constructor.name} ${
+  storage[SymbolFor("Deno.privateCustomInspect")] = function (
+    inspect,
+    inspectOptions,
+  ) {
+    return `Storage ${
       inspect({
-        length: this.length,
         ...ObjectFromEntries(ObjectEntries(proxy)),
-      })
+        length: this.length,
+      }, inspectOptions)
     }`;
   };
 
