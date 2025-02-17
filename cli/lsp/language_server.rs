@@ -8,6 +8,7 @@ use std::collections::VecDeque;
 use std::env;
 use std::fmt::Write as _;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -43,6 +44,7 @@ use serde_json::from_value;
 use tokio::sync::mpsc::unbounded_channel;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::UnboundedSender;
+use tokio_util::sync::CancellationToken;
 use tower_lsp::jsonrpc::Error as LspError;
 use tower_lsp::jsonrpc::Result as LspResult;
 use tower_lsp::lsp_types::request::*;
@@ -127,7 +129,7 @@ impl RootCertStoreProvider for LspRootCertStoreProvider {
 #[derive(Debug, Clone)]
 pub struct LanguageServer {
   client: Client,
-  pub inner: Arc<tokio::sync::RwLock<Inner>>,
+  pub inner: Rc<tokio::sync::RwLock<Inner>>,
   /// This is used to block out standard request handling until the complete
   /// user configuration has been fetched. This is done in the `initialized`
   /// handler which normally may occur concurrently with those other requests.
@@ -225,6 +227,8 @@ pub struct Inner {
   /// Set to `self.config.settings.enable_settings_hash()` after
   /// refreshing `self.workspace_files`.
   workspace_files_hash: u64,
+
+  _tracing: Option<super::trace::TracingGuard>,
 }
 
 impl LanguageServer {
@@ -232,7 +236,7 @@ impl LanguageServer {
     let performance = Arc::new(Performance::default());
     Self {
       client: client.clone(),
-      inner: Arc::new(tokio::sync::RwLock::new(Inner::new(
+      inner: Rc::new(tokio::sync::RwLock::new(Inner::new(
         client,
         performance.clone(),
       ))),
@@ -244,6 +248,7 @@ impl LanguageServer {
 
   /// Similar to `deno install --entrypoint` on the command line, where modules will be cached
   /// in the Deno cache, including any of their dependencies.
+  #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
   pub async fn cache(
     &self,
     specifiers: Vec<ModuleSpecifier>,
@@ -345,6 +350,7 @@ impl LanguageServer {
   /// coordinate the tests receiving the latest diagnostics.
   pub async fn latest_diagnostic_batch_index_request(
     &self,
+    _token: CancellationToken,
   ) -> LspResult<Option<Value>> {
     if !self.init_flag.is_raised() {
       self.init_flag.wait_raised().await;
@@ -360,14 +366,20 @@ impl LanguageServer {
     )
   }
 
-  pub async fn performance_request(&self) -> LspResult<Option<Value>> {
+  pub async fn performance_request(
+    &self,
+    _token: CancellationToken,
+  ) -> LspResult<Option<Value>> {
     if !self.init_flag.is_raised() {
       self.init_flag.wait_raised().await;
     }
     Ok(Some(self.inner.read().await.get_performance()))
   }
 
-  pub async fn task_definitions(&self) -> LspResult<Vec<TaskDefinition>> {
+  pub async fn task_definitions(
+    &self,
+    _token: CancellationToken,
+  ) -> LspResult<Vec<TaskDefinition>> {
     if !self.init_flag.is_raised() {
       self.init_flag.wait_raised().await;
     }
@@ -377,6 +389,7 @@ impl LanguageServer {
   pub async fn test_run_request(
     &self,
     params: Option<Value>,
+    _token: CancellationToken,
   ) -> LspResult<Option<Value>> {
     if !self.init_flag.is_raised() {
       self.init_flag.wait_raised().await;
@@ -387,6 +400,7 @@ impl LanguageServer {
   pub async fn test_run_cancel_request(
     &self,
     params: Option<Value>,
+    _token: CancellationToken,
   ) -> LspResult<Option<Value>> {
     if !self.init_flag.is_raised() {
       self.init_flag.wait_raised().await;
@@ -397,6 +411,7 @@ impl LanguageServer {
   pub async fn virtual_text_document(
     &self,
     params: Option<Value>,
+    _token: CancellationToken,
   ) -> LspResult<Option<Value>> {
     if !self.init_flag.is_raised() {
       self.init_flag.wait_raised().await;
@@ -419,6 +434,7 @@ impl LanguageServer {
     }
   }
 
+  #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
   pub async fn refresh_configuration(&self) {
     let (folders, capable) = {
       let inner = self.inner.read().await;
@@ -482,7 +498,7 @@ impl Inner {
       ts_server.clone(),
       diagnostics_state.clone(),
     );
-    let assets = Assets::new(ts_server.clone());
+    let assets = Assets::new();
     let initial_cwd = std::env::current_dir().unwrap_or_else(|_| {
       panic!("Could not resolve current working directory")
     });
@@ -510,11 +526,13 @@ impl Inner {
       url_map: Default::default(),
       workspace_files: Default::default(),
       workspace_files_hash: 0,
+      _tracing: Default::default(),
     }
   }
 
   /// Searches assets and documents for the provided
   /// specifier erroring if it doesn't exist.
+  #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
   pub fn get_asset_or_document(
     &self,
     specifier: &ModuleSpecifier,
@@ -541,9 +559,11 @@ impl Inner {
     }
   }
 
+  #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
   pub async fn get_navigation_tree(
     &self,
     specifier: &ModuleSpecifier,
+    token: &CancellationToken,
   ) -> Result<Arc<tsc::NavigationTree>, AnyError> {
     let mark = self.performance.mark_with_args(
       "lsp.get_navigation_tree",
@@ -560,6 +580,7 @@ impl Inner {
             self.snapshot(),
             specifier.clone(),
             asset_or_doc.scope().cloned(),
+            token,
           )
           .await?;
         let navigation_tree = Arc::new(navigation_tree);
@@ -602,6 +623,7 @@ impl Inner {
     }
   }
 
+  #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
   pub fn snapshot(&self) -> Arc<StateSnapshot> {
     Arc::new(StateSnapshot {
       project_version: self.project_version,
@@ -612,6 +634,40 @@ impl Inner {
     })
   }
 
+  pub fn update_tracing(&mut self) {
+    let tracing =
+      self
+        .config
+        .workspace_settings()
+        .tracing
+        .clone()
+        .or_else(|| {
+          std::env::var("DENO_LSP_TRACE").ok().map(|_| {
+            super::trace::TracingConfig {
+              enable: true,
+              ..Default::default()
+            }
+            .into()
+          })
+        });
+    self
+      .ts_server
+      .set_tracing_enabled(tracing.as_ref().is_some_and(|t| t.enabled()));
+    self._tracing = tracing.and_then(|conf| {
+      if !conf.enabled() {
+        return None;
+      }
+      lsp_log!("Initializing tracing subscriber: {:#?}", conf);
+      let config = conf.into();
+      super::trace::init_tracing_subscriber(&config)
+        .inspect_err(|e| {
+          lsp_warn!("Error initializing tracing subscriber: {e:#}");
+        })
+        .ok()
+    });
+  }
+
+  #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
   pub async fn update_global_cache(&mut self) {
     let mark = self.performance.mark("lsp.update_global_cache");
     let maybe_cache = self.config.workspace_settings().cache.as_ref();
@@ -669,6 +725,7 @@ impl Inner {
     self.performance.measure(mark);
   }
 
+  #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
   pub fn update_cache(&mut self) {
     let mark = self.performance.mark("lsp.update_cache");
     self.cache.update_config(&self.config);
@@ -778,6 +835,7 @@ impl Inner {
       return Err(tower_lsp::jsonrpc::Error::internal_error());
     };
 
+    self.update_tracing();
     self.update_debug_flag();
 
     if capabilities.code_action_provider.is_some() {
@@ -787,7 +845,6 @@ impl Inner {
         .await?;
       self.ts_fixable_diagnostics = fixable_diagnostics;
     }
-    self.assets.initialize(self.snapshot()).await;
 
     self.performance.measure(mark);
     Ok(InitializeResult {
@@ -797,6 +854,7 @@ impl Inner {
     })
   }
 
+  #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
   fn walk_workspace(config: &Config) -> (IndexSet<ModuleSpecifier>, bool) {
     if !config.workspace_capable() {
       log::debug!("Skipped workspace walk due to client incapability.");
@@ -956,6 +1014,7 @@ impl Inner {
     self.workspace_files_hash = enable_settings_hash;
   }
 
+  #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
   async fn refresh_config_tree(&mut self) {
     let file_fetcher = CliFileFetcher::new(
       self.cache.global().clone(),
@@ -1011,6 +1070,7 @@ impl Inner {
     }
   }
 
+  #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
   async fn refresh_resolver(&mut self) {
     self.resolver = Arc::new(
       LspResolver::from_config(
@@ -1022,6 +1082,7 @@ impl Inner {
     );
   }
 
+  #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
   async fn refresh_documents_config(&mut self) {
     self.documents.update_config(
       &self.config,
@@ -1037,6 +1098,7 @@ impl Inner {
     self.project_changed([], true);
   }
 
+  #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
   async fn did_open(&mut self, params: DidOpenTextDocumentParams) {
     let mark = self.performance.mark_with_args("lsp.did_open", &params);
     let Some(scheme) = params.text_document.uri.scheme() else {
@@ -1086,6 +1148,7 @@ impl Inner {
     self.performance.measure(mark);
   }
 
+  #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
   async fn did_change(&mut self, params: DidChangeTextDocumentParams) {
     let mark = self.performance.mark_with_args("lsp.did_change", &params);
     let specifier = self
@@ -1123,6 +1186,7 @@ impl Inner {
     self.performance.measure(mark);
   }
 
+  #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
   fn did_save(&mut self, params: DidSaveTextDocumentParams) {
     let _mark = self.performance.measure_scope("lsp.did_save");
     let specifier = self
@@ -1151,17 +1215,16 @@ impl Inner {
     }));
   }
 
+  #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
   async fn refresh_dep_info(&mut self) {
     let dep_info_by_scope = self.documents.dep_info_by_scope();
-    let resolver = self.resolver.clone();
-    // spawn due to the lsp's `Send` requirement
-    spawn(
-      async move { resolver.set_dep_info_by_scope(&dep_info_by_scope).await },
-    )
-    .await
-    .ok();
+    self
+      .resolver
+      .set_dep_info_by_scope(&dep_info_by_scope)
+      .await;
   }
 
+  #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
   async fn did_close(&mut self, params: DidCloseTextDocumentParams) {
     let mark = self.performance.mark_with_args("lsp.did_close", &params);
     let Some(scheme) = params.text_document.uri.scheme() else {
@@ -1188,6 +1251,7 @@ impl Inner {
     self.performance.measure(mark);
   }
 
+  #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
   async fn did_change_configuration(
     &mut self,
     params: DidChangeConfigurationParams,
@@ -1206,6 +1270,8 @@ impl Inner {
         self.config.set_workspace_settings(settings, vec![]);
       }
     };
+    // TODO(nathanwhit): allow updating after startup, needs work to set thread local collector on tsc thread
+    // self.update_tracing();
     self.update_debug_flag();
     self.update_global_cache().await;
     self.refresh_workspace_files();
@@ -1218,6 +1284,7 @@ impl Inner {
     self.send_testing_update();
   }
 
+  #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip(self)))]
   async fn did_change_watched_files(
     &mut self,
     params: DidChangeWatchedFilesParams,
@@ -1303,9 +1370,11 @@ impl Inner {
     self.performance.measure(mark);
   }
 
+  #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
   async fn document_symbol(
     &self,
     params: DocumentSymbolParams,
+    token: &CancellationToken,
   ) -> LspResult<Option<DocumentSymbolResponse>> {
     let specifier = self
       .url_map
@@ -1322,18 +1391,27 @@ impl Inner {
     let asset_or_document = self.get_asset_or_document(&specifier)?;
     let line_index = asset_or_document.line_index();
 
-    let navigation_tree =
-      self.get_navigation_tree(&specifier).await.map_err(|err| {
-        error!(
-          "Error getting document symbols for \"{}\": {:#}",
-          specifier, err
-        );
-        LspError::internal_error()
+    let navigation_tree = self
+      .get_navigation_tree(&specifier, token)
+      .await
+      .map_err(|err| {
+        if token.is_cancelled() {
+          LspError::request_cancelled()
+        } else {
+          error!(
+            "Error getting navigation tree for \"{}\": {:#}",
+            specifier, err
+          );
+          LspError::internal_error()
+        }
       })?;
 
     let response = if let Some(child_items) = &navigation_tree.child_items {
       let mut document_symbols = Vec::<DocumentSymbol>::new();
       for item in child_items {
+        if token.is_cancelled() {
+          return Err(LspError::request_cancelled());
+        }
         item
           .collect_document_symbols(line_index.clone(), &mut document_symbols);
       }
@@ -1345,9 +1423,11 @@ impl Inner {
     Ok(response)
   }
 
+  #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
   async fn formatting(
     &self,
     params: DocumentFormattingParams,
+    _token: &CancellationToken,
   ) -> LspResult<Option<Vec<TextEdit>>> {
     let file_referrer = Some(uri_to_url(&params.text_document.uri))
       .filter(|s| self.documents.is_valid_file_referrer(s));
@@ -1458,7 +1538,12 @@ impl Inner {
     }
   }
 
-  async fn hover(&self, params: HoverParams) -> LspResult<Option<Hover>> {
+  #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
+  async fn hover(
+    &self,
+    params: HoverParams,
+    token: &CancellationToken,
+  ) -> LspResult<Option<Hover>> {
     let specifier = self.url_map.uri_to_specifier(
       &params.text_document_position_params.text_document.uri,
       LspUrlKind::File,
@@ -1536,13 +1621,24 @@ impl Inner {
           specifier.clone(),
           position,
           asset_or_doc.scope().cloned(),
+          token,
         )
-        .await?;
+        .await
+        .map_err(|err| {
+          if token.is_cancelled() {
+            LspError::request_cancelled()
+          } else {
+            error!("Unable to get quick info from TypeScript: {:#}", err);
+            LspError::internal_error()
+          }
+        })?;
       maybe_quick_info.map(|qi| qi.to_hover(line_index, self))
     };
     self.performance.measure(mark);
     Ok(hover)
   }
+
+  #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
 
   fn resolution_to_hover_text(
     &self,
@@ -1586,9 +1682,11 @@ impl Inner {
     }
   }
 
+  #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
   async fn code_action(
     &self,
     params: CodeActionParams,
+    token: &CancellationToken,
   ) -> LspResult<Option<CodeActionResponse>> {
     let specifier = self
       .url_map
@@ -1670,9 +1768,26 @@ impl Inner {
                   &specifier,
                 ),
                 asset_or_doc.scope().cloned(),
+                token,
               )
-              .await;
+              .await
+              .unwrap_or_else(|err| {
+                // sometimes tsc reports errors when retrieving code actions
+                // because they don't reflect the current state of the document
+                // so we will log them to the output, but we won't send an error
+                // message back to the client.
+                if !token.is_cancelled() {
+                  error!(
+                    "Unable to get code actions from TypeScript: {:#}",
+                    err
+                  );
+                }
+                vec![]
+              });
             for action in actions {
+              if token.is_cancelled() {
+                return Err(LspError::request_cancelled());
+              }
               code_actions
                 .add_ts_fix_action(
                   &specifier,
@@ -1776,13 +1891,35 @@ impl Inner {
         params.context.trigger_kind,
         only,
         asset_or_doc.scope().cloned(),
+        token,
       )
-      .await?;
-    let mut refactor_actions = Vec::<CodeAction>::new();
-    for refactor_info in refactor_infos.iter() {
-      refactor_actions
-        .extend(refactor_info.to_code_actions(&specifier, &params.range));
-    }
+      .await
+      .map_err(|err| {
+        if token.is_cancelled() {
+          LspError::request_cancelled()
+        } else {
+          error!("Unable to get refactor info from TypeScript: {:#}", err);
+          LspError::internal_error()
+        }
+      })?;
+    let refactor_actions = refactor_infos
+      .into_iter()
+      .map(|refactor_info| {
+        refactor_info
+          .to_code_actions(&specifier, &params.range, token)
+          .map_err(|err| {
+            if token.is_cancelled() {
+              LspError::request_cancelled()
+            } else {
+              error!("Unable to convert refactor info: {:#}", err);
+              LspError::internal_error()
+            }
+          })
+      })
+      .collect::<Result<Vec<_>, _>>()?
+      .into_iter()
+      .flatten()
+      .collect();
     all_actions.extend(
       refactor::prune_invalid_actions(refactor_actions, 5)
         .into_iter()
@@ -1805,9 +1942,11 @@ impl Inner {
     Ok(response)
   }
 
+  #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
   async fn code_action_resolve(
     &self,
     params: CodeAction,
+    token: &CancellationToken,
   ) -> LspResult<CodeAction> {
     if params.kind.is_none() || params.data.is_none() {
       return Ok(params);
@@ -1845,20 +1984,32 @@ impl Inner {
             &code_action_data.specifier,
           ),
           scope,
+          token,
         )
-        .await?;
+        .await
+        .map_err(|err| {
+          if token.is_cancelled() {
+            LspError::request_cancelled()
+          } else {
+            error!("Unable to get combined fix from TypeScript: {:#}", err);
+            LspError::internal_error()
+          }
+        })?;
       if combined_code_actions.commands.is_some() {
         error!("Deno does not support code actions with commands.");
         return Err(LspError::invalid_request());
       }
 
       let changes = if code_action_data.fix_id == "fixMissingImport" {
-        fix_ts_import_changes(&combined_code_actions.changes, self).map_err(
-          |err| {
-            error!("Unable to remap changes: {:#}", err);
-            LspError::internal_error()
-          },
-        )?
+        fix_ts_import_changes(&combined_code_actions.changes, self, token)
+          .map_err(|err| {
+            if token.is_cancelled() {
+              LspError::request_cancelled()
+            } else {
+              error!("Unable to fix import changes: {:#}", err);
+              LspError::internal_error()
+            }
+          })?
       } else {
         combined_code_actions.changes
       };
@@ -1900,20 +2051,35 @@ impl Inner {
             &action_data.specifier,
           )),
           asset_or_doc.scope().cloned(),
+          token,
         )
-        .await?;
+        .await
+        .map_err(|err| {
+          if token.is_cancelled() {
+            LspError::request_cancelled()
+          } else {
+            error!(
+              "Unable to get refactor edit info from TypeScript: {:#}",
+              err
+            );
+            LspError::invalid_request()
+          }
+        })?;
       if kind_suffix == ".rewrite.function.returnType"
         || kind_suffix == ".move.newFile"
       {
         refactor_edit_info.edits =
-          fix_ts_import_changes(&refactor_edit_info.edits, self).map_err(
-            |err| {
-              error!("Unable to remap changes: {:#}", err);
-              LspError::internal_error()
-            },
-          )?
+          fix_ts_import_changes(&refactor_edit_info.edits, self, token)
+            .map_err(|err| {
+              if token.is_cancelled() {
+                LspError::request_cancelled()
+              } else {
+                error!("Unable to fix import changes: {:#}", err);
+                LspError::internal_error()
+              }
+            })?
       }
-      code_action.edit = refactor_edit_info.to_workspace_edit(self)?;
+      code_action.edit = refactor_edit_info.to_workspace_edit(self, token)?;
       code_action
     } else {
       // The code action doesn't need to be resolved
@@ -1943,9 +2109,11 @@ impl Inner {
     )
   }
 
+  #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
   async fn code_lens(
     &self,
     params: CodeLensParams,
+    token: &CancellationToken,
   ) -> LspResult<Option<Vec<CodeLens>>> {
     let specifier = self
       .url_map
@@ -1965,24 +2133,37 @@ impl Inner {
     {
       if let Some(Ok(parsed_source)) = asset_or_doc.maybe_parsed_source() {
         code_lenses.extend(
-          code_lens::collect_test(&specifier, parsed_source).map_err(
+          code_lens::collect_test(&specifier, parsed_source, token).map_err(
             |err| {
-              error!(
-                "Error getting test code lenses for \"{}\": {:#}",
-                &specifier, err
-              );
-              LspError::internal_error()
+              if token.is_cancelled() {
+                LspError::request_cancelled()
+              } else {
+                error!(
+                  "Error getting test code lenses for \"{}\": {:#}",
+                  &specifier, err
+                );
+                LspError::internal_error()
+              }
             },
           )?,
         );
       }
     }
     if settings.code_lens.implementations || settings.code_lens.references {
-      let navigation_tree =
-        self.get_navigation_tree(&specifier).await.map_err(|err| {
-          error!("Error getting code lenses for \"{}\": {:#}", specifier, err);
+      let navigation_tree = self
+        .get_navigation_tree(&specifier, token)
+        .await
+        .map_err(|err| {
+        if token.is_cancelled() {
+          LspError::request_cancelled()
+        } else {
+          error!(
+            "Error getting navigation tree for \"{}\": {:#}",
+            specifier, err
+          );
           LspError::internal_error()
-        })?;
+        }
+      })?;
       let line_index = asset_or_doc.line_index();
       code_lenses.extend(
         code_lens::collect_tsc(
@@ -1990,13 +2171,18 @@ impl Inner {
           &settings.code_lens,
           line_index,
           &navigation_tree,
+          token,
         )
         .map_err(|err| {
-          error!(
-            "Error getting ts code lenses for \"{:#}\": {:#}",
-            &specifier, err
-          );
-          LspError::internal_error()
+          if token.is_cancelled() {
+            LspError::request_cancelled()
+          } else {
+            error!(
+              "Error getting ts code lenses for \"{:#}\": {:#}",
+              &specifier, err
+            );
+            LspError::internal_error()
+          }
         })?,
       );
     }
@@ -2008,19 +2194,25 @@ impl Inner {
     Ok(Some(code_lenses))
   }
 
+  #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
   async fn code_lens_resolve(
     &self,
     code_lens: CodeLens,
+    token: &CancellationToken,
   ) -> LspResult<CodeLens> {
     let mark = self
       .performance
       .mark_with_args("lsp.code_lens_resolve", &code_lens);
     let result = if code_lens.data.is_some() {
-      code_lens::resolve_code_lens(code_lens, self)
+      code_lens::resolve_code_lens(code_lens, self, token)
         .await
         .map_err(|err| {
-          error!("Error resolving code lens: {:#}", err);
-          LspError::internal_error()
+          if token.is_cancelled() {
+            LspError::request_cancelled()
+          } else {
+            error!("Unable to get resolved code lens: {:#}", err);
+            LspError::internal_error()
+          }
         })
     } else {
       Err(LspError::invalid_params(
@@ -2031,9 +2223,11 @@ impl Inner {
     result
   }
 
+  #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
   async fn document_highlight(
     &self,
     params: DocumentHighlightParams,
+    token: &CancellationToken,
   ) -> LspResult<Option<Vec<DocumentHighlight>>> {
     let specifier = self.url_map.uri_to_specifier(
       &params.text_document_position_params.text_document.uri,
@@ -2059,25 +2253,48 @@ impl Inner {
         line_index.offset_tsc(params.text_document_position_params.position)?,
         files_to_search,
         asset_or_doc.scope().cloned(),
+        token,
       )
-      .await?;
+      .await
+      .map_err(|err| {
+        if token.is_cancelled() {
+          LspError::request_cancelled()
+        } else {
+          error!(
+            "Unable to get document highlights from TypeScript: {:#}",
+            err
+          );
+          LspError::internal_error()
+        }
+      })?;
 
-    if let Some(document_highlights) = maybe_document_highlights {
-      let result = document_highlights
-        .into_iter()
-        .flat_map(|dh| dh.to_highlight(line_index.clone()))
-        .collect();
-      self.performance.measure(mark);
-      Ok(Some(result))
-    } else {
-      self.performance.measure(mark);
-      Ok(None)
-    }
+    let document_highlights = maybe_document_highlights
+      .map(|document_highlights| {
+        document_highlights
+          .into_iter()
+          .map(|dh| {
+            dh.to_highlight(line_index.clone(), token).map_err(|err| {
+              if token.is_cancelled() {
+                LspError::request_cancelled()
+              } else {
+                error!("Unable to convert document highlights: {:#}", err);
+                LspError::internal_error()
+              }
+            })
+          })
+          .collect::<Result<Vec<_>, _>>()
+          .map(|s| s.into_iter().flatten().collect())
+      })
+      .transpose()?;
+    self.performance.measure(mark);
+    Ok(document_highlights)
   }
 
+  #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
   async fn references(
     &self,
     params: ReferenceParams,
+    token: &CancellationToken,
   ) -> LspResult<Option<Vec<Location>>> {
     let specifier = self.url_map.uri_to_specifier(
       &params.text_document_position.text_document.uri,
@@ -2098,16 +2315,24 @@ impl Inner {
         self.snapshot(),
         specifier.clone(),
         line_index.offset_tsc(params.text_document_position.position)?,
+        token,
       )
       .await
       .map_err(|err| {
-        lsp_warn!("Unable to find references: {err}");
-        LspError::internal_error()
+        if token.is_cancelled() {
+          LspError::request_cancelled()
+        } else {
+          error!("Unable to get references from TypeScript: {:#}", err);
+          LspError::internal_error()
+        }
       })?;
 
     if let Some(symbols) = maybe_referenced_symbols {
       let mut results = Vec::new();
       for reference in symbols.iter().flat_map(|s| &s.references) {
+        if token.is_cancelled() {
+          return Err(LspError::request_cancelled());
+        }
         if !params.context.include_declaration && reference.is_definition {
           continue;
         }
@@ -2131,9 +2356,11 @@ impl Inner {
     }
   }
 
+  #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
   async fn goto_definition(
     &self,
     params: GotoDefinitionParams,
+    token: &CancellationToken,
   ) -> LspResult<Option<GotoDefinitionResponse>> {
     let specifier = self.url_map.uri_to_specifier(
       &params.text_document_position_params.text_document.uri,
@@ -2157,11 +2384,30 @@ impl Inner {
         specifier,
         line_index.offset_tsc(params.text_document_position_params.position)?,
         asset_or_doc.scope().cloned(),
+        token,
       )
-      .await?;
+      .await
+      .map_err(|err| {
+        if token.is_cancelled() {
+          LspError::request_cancelled()
+        } else {
+          error!("Unable to get definition info from TypeScript: {:#}", err);
+          LspError::internal_error()
+        }
+      })?;
 
     if let Some(definition) = maybe_definition {
-      let results = definition.to_definition(line_index, self);
+      let results =
+        definition
+          .to_definition(line_index, self, token)
+          .map_err(|err| {
+            if token.is_cancelled() {
+              LspError::request_cancelled()
+            } else {
+              error!("Unable to convert definition info: {:#}", err);
+              LspError::internal_error()
+            }
+          })?;
       self.performance.measure(mark);
       Ok(results)
     } else {
@@ -2170,9 +2416,11 @@ impl Inner {
     }
   }
 
+  #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
   async fn goto_type_definition(
     &self,
     params: GotoTypeDefinitionParams,
+    token: &CancellationToken,
   ) -> LspResult<Option<GotoTypeDefinitionResponse>> {
     let specifier = self.url_map.uri_to_specifier(
       &params.text_document_position_params.text_document.uri,
@@ -2196,12 +2444,27 @@ impl Inner {
         specifier,
         line_index.offset_tsc(params.text_document_position_params.position)?,
         asset_or_doc.scope().cloned(),
+        token,
       )
-      .await?;
+      .await
+      .map_err(|err| {
+        if token.is_cancelled() {
+          LspError::request_cancelled()
+        } else {
+          error!(
+            "Unable to get type definition info from TypeScript: {:#}",
+            err
+          );
+          LspError::internal_error()
+        }
+      })?;
 
     let response = if let Some(definition_info) = maybe_definition_info {
       let mut location_links = Vec::new();
       for info in definition_info {
+        if token.is_cancelled() {
+          return Err(LspError::request_cancelled());
+        }
         if let Some(link) = info.document_span.to_link(line_index.clone(), self)
         {
           location_links.push(link);
@@ -2216,9 +2479,11 @@ impl Inner {
     Ok(response)
   }
 
+  #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
   async fn completion(
     &self,
     params: CompletionParams,
+    token: &CancellationToken,
   ) -> LspResult<Option<CompletionResponse>> {
     let specifier = self.url_map.uri_to_specifier(
       &params.text_document_position.text_document.uri,
@@ -2300,27 +2565,40 @@ impl Inner {
             .options)
             .into(),
           scope.cloned(),
+          token,
         )
         .await
         .unwrap_or_else(|err| {
-          error!("Unable to get completion info from TypeScript: {:#}", err);
+          if !token.is_cancelled() {
+            error!("Unable to get completion info from TypeScript: {:#}", err);
+          }
           None
         });
 
       if let Some(completions) = maybe_completion_info {
         response = Some(
-          completions.as_completion_response(
-            line_index,
-            &self
-              .config
-              .language_settings_for_specifier(&specifier)
-              .cloned()
-              .unwrap_or_default()
-              .suggest,
-            &specifier,
-            position,
-            self,
-          ),
+          completions
+            .as_completion_response(
+              line_index,
+              &self
+                .config
+                .language_settings_for_specifier(&specifier)
+                .cloned()
+                .unwrap_or_default()
+                .suggest,
+              &specifier,
+              position,
+              self,
+              token,
+            )
+            .map_err(|err| {
+              if token.is_cancelled() {
+                LspError::request_cancelled()
+              } else {
+                error!("Unable to convert completion info: {:#}", err);
+                LspError::internal_error()
+              }
+            })?,
         );
       }
     };
@@ -2328,9 +2606,11 @@ impl Inner {
     Ok(response)
   }
 
+  #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
   async fn completion_resolve(
     &self,
     params: CompletionItem,
+    token: &CancellationToken,
   ) -> LspResult<CompletionItem> {
     let mark = self
       .performance
@@ -2367,6 +2647,7 @@ impl Inner {
               ..data.into()
             },
             scope,
+            token,
           )
           .await;
         match result {
@@ -2389,7 +2670,12 @@ impl Inner {
             }
           }
           Err(err) => {
-            error!("Unable to get completion info from TypeScript: {:#}", err);
+            if !token.is_cancelled() {
+              error!(
+                "Unable to get completion info from TypeScript: {:#}",
+                err
+              );
+            }
             return Ok(params);
           }
         }
@@ -2409,9 +2695,11 @@ impl Inner {
     Ok(completion_item)
   }
 
+  #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
   async fn goto_implementation(
     &self,
     params: GotoImplementationParams,
+    token: &CancellationToken,
   ) -> LspResult<Option<GotoImplementationResponse>> {
     let specifier = self.url_map.uri_to_specifier(
       &params.text_document_position_params.text_document.uri,
@@ -2435,16 +2723,27 @@ impl Inner {
         self.snapshot(),
         specifier,
         line_index.offset_tsc(params.text_document_position_params.position)?,
+        token,
       )
       .await
       .map_err(|err| {
-        lsp_warn!("{:#}", err);
-        LspError::internal_error()
+        if token.is_cancelled() {
+          LspError::request_cancelled()
+        } else {
+          lsp_warn!(
+            "Unable to get implementation locations from TypeScript: {:#}",
+            err
+          );
+          LspError::internal_error()
+        }
       })?;
 
     let result = if let Some(implementations) = maybe_implementations {
       let mut links = Vec::new();
       for implementation in implementations {
+        if token.is_cancelled() {
+          return Err(LspError::request_cancelled());
+        }
         if let Some(link) = implementation.to_link(line_index.clone(), self) {
           links.push(link)
         }
@@ -2458,9 +2757,11 @@ impl Inner {
     Ok(result)
   }
 
+  #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
   async fn folding_range(
     &self,
     params: FoldingRangeParams,
+    token: &CancellationToken,
   ) -> LspResult<Option<Vec<FoldingRange>>> {
     let specifier = self
       .url_map
@@ -2482,21 +2783,33 @@ impl Inner {
         self.snapshot(),
         specifier,
         asset_or_doc.scope().cloned(),
+        token,
       )
-      .await?;
+      .await
+      .map_err(|err| {
+        if token.is_cancelled() {
+          LspError::request_cancelled()
+        } else {
+          lsp_warn!("Unable to get outlining spans from TypeScript: {:#}", err);
+          LspError::invalid_request()
+        }
+      })?;
 
     let response = if !outlining_spans.is_empty() {
       Some(
         outlining_spans
           .iter()
           .map(|span| {
-            span.to_folding_range(
+            if token.is_cancelled() {
+              return Err(LspError::request_cancelled());
+            }
+            Ok(span.to_folding_range(
               asset_or_doc.line_index(),
               asset_or_doc.text().as_bytes(),
               self.config.line_folding_only_capable(),
-            )
+            ))
           })
-          .collect::<Vec<FoldingRange>>(),
+          .collect::<Result<Vec<_>, _>>()?,
       )
     } else {
       None
@@ -2505,9 +2818,11 @@ impl Inner {
     Ok(response)
   }
 
+  #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
   async fn incoming_calls(
     &self,
     params: CallHierarchyIncomingCallsParams,
+    token: &CancellationToken,
   ) -> LspResult<Option<Vec<CallHierarchyIncomingCall>>> {
     let specifier = self
       .url_map
@@ -2530,11 +2845,16 @@ impl Inner {
         self.snapshot(),
         specifier,
         line_index.offset_tsc(params.item.selection_range.start)?,
+        token,
       )
       .await
       .map_err(|err| {
-        lsp_warn!("{:#}", err);
-        LspError::internal_error()
+        if token.is_cancelled() {
+          LspError::request_cancelled()
+        } else {
+          lsp_warn!("Unable to get incoming calls from TypeScript: {:#}", err);
+          LspError::internal_error()
+        }
       })?;
 
     let maybe_root_path_owned = self
@@ -2543,6 +2863,9 @@ impl Inner {
       .and_then(|uri| url_to_file_path(uri).ok());
     let mut resolved_items = Vec::<CallHierarchyIncomingCall>::new();
     for item in incoming_calls.iter() {
+      if token.is_cancelled() {
+        return Err(LspError::request_cancelled());
+      }
       if let Some(resolved) = item.try_resolve_call_hierarchy_incoming_call(
         self,
         maybe_root_path_owned.as_deref(),
@@ -2554,9 +2877,11 @@ impl Inner {
     Ok(Some(resolved_items))
   }
 
+  #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
   async fn outgoing_calls(
     &self,
     params: CallHierarchyOutgoingCallsParams,
+    token: &CancellationToken,
   ) -> LspResult<Option<Vec<CallHierarchyOutgoingCall>>> {
     let specifier = self
       .url_map
@@ -2580,8 +2905,17 @@ impl Inner {
         specifier,
         line_index.offset_tsc(params.item.selection_range.start)?,
         asset_or_doc.scope().cloned(),
+        token,
       )
-      .await?;
+      .await
+      .map_err(|err| {
+        if token.is_cancelled() {
+          LspError::request_cancelled()
+        } else {
+          lsp_warn!("Unable to get outgoing calls from TypeScript: {:#}", err);
+          LspError::invalid_request()
+        }
+      })?;
 
     let maybe_root_path_owned = self
       .config
@@ -2589,6 +2923,9 @@ impl Inner {
       .and_then(|uri| url_to_file_path(uri).ok());
     let mut resolved_items = Vec::<CallHierarchyOutgoingCall>::new();
     for item in outgoing_calls.iter() {
+      if token.is_cancelled() {
+        return Err(LspError::request_cancelled());
+      }
       if let Some(resolved) = item.try_resolve_call_hierarchy_outgoing_call(
         line_index.clone(),
         self,
@@ -2601,9 +2938,11 @@ impl Inner {
     Ok(Some(resolved_items))
   }
 
+  #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
   async fn prepare_call_hierarchy(
     &self,
     params: CallHierarchyPrepareParams,
+    token: &CancellationToken,
   ) -> LspResult<Option<Vec<CallHierarchyItem>>> {
     let specifier = self.url_map.uri_to_specifier(
       &params.text_document_position_params.text_document.uri,
@@ -2628,8 +2967,17 @@ impl Inner {
         specifier,
         line_index.offset_tsc(params.text_document_position_params.position)?,
         asset_or_doc.scope().cloned(),
+        token,
       )
-      .await?;
+      .await
+      .map_err(|err| {
+        if token.is_cancelled() {
+          LspError::request_cancelled()
+        } else {
+          lsp_warn!("Unable to get call hierarchy from TypeScript: {:#}", err);
+          LspError::invalid_request()
+        }
+      })?;
 
     let response = if let Some(one_or_many) = maybe_one_or_many {
       let maybe_root_path_owned = self
@@ -2648,6 +2996,9 @@ impl Inner {
         }
         tsc::OneOrMany::Many(items) => {
           for item in items.iter() {
+            if token.is_cancelled() {
+              return Err(LspError::request_cancelled());
+            }
             if let Some(resolved) = item.try_resolve_call_hierarchy_item(
               self,
               maybe_root_path_owned.as_deref(),
@@ -2665,9 +3016,11 @@ impl Inner {
     Ok(response)
   }
 
+  #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
   async fn rename(
     &self,
     params: RenameParams,
+    token: &CancellationToken,
   ) -> LspResult<Option<WorkspaceEdit>> {
     let specifier = self.url_map.uri_to_specifier(
       &params.text_document_position.text_document.uri,
@@ -2689,20 +3042,32 @@ impl Inner {
         self.snapshot(),
         specifier,
         line_index.offset_tsc(params.text_document_position.position)?,
+        token,
       )
       .await
       .map_err(|err| {
-        lsp_warn!("{:#}", err);
-        LspError::internal_error()
+        if token.is_cancelled() {
+          LspError::request_cancelled()
+        } else {
+          lsp_warn!(
+            "Unable to get rename locations from TypeScript: {:#}",
+            err
+          );
+          LspError::internal_error()
+        }
       })?;
 
     if let Some(locations) = maybe_locations {
       let rename_locations = tsc::RenameLocations { locations };
       let workspace_edits = rename_locations
-        .into_workspace_edit(&params.new_name, self)
+        .into_workspace_edit(&params.new_name, self, token)
         .map_err(|err| {
-          error!("Failed to get workspace edits: {:#}", err);
-          LspError::internal_error()
+          if token.is_cancelled() {
+            LspError::request_cancelled()
+          } else {
+            lsp_warn!("Unable to covert rename locations: {:#}", err);
+            LspError::internal_error()
+          }
         })?;
       self.performance.measure(mark);
       Ok(Some(workspace_edits))
@@ -2712,9 +3077,11 @@ impl Inner {
     }
   }
 
+  #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
   async fn selection_range(
     &self,
     params: SelectionRangeParams,
+    token: &CancellationToken,
   ) -> LspResult<Option<Vec<SelectionRange>>> {
     let specifier = self
       .url_map
@@ -2733,6 +3100,9 @@ impl Inner {
 
     let mut selection_ranges = Vec::<SelectionRange>::new();
     for position in params.positions {
+      if token.is_cancelled() {
+        return Err(LspError::request_cancelled());
+      }
       let selection_range: tsc::SelectionRange = self
         .ts_server
         .get_smart_selection_range(
@@ -2740,8 +3110,20 @@ impl Inner {
           specifier.clone(),
           line_index.offset_tsc(position)?,
           asset_or_doc.scope().cloned(),
+          token,
         )
-        .await?;
+        .await
+        .map_err(|err| {
+          if token.is_cancelled() {
+            LspError::request_cancelled()
+          } else {
+            lsp_warn!(
+              "Unable to get selection ranges from TypeScript: {:#}",
+              err
+            );
+            LspError::invalid_request()
+          }
+        })?;
 
       selection_ranges
         .push(selection_range.to_selection_range(line_index.clone()));
@@ -2750,9 +3132,11 @@ impl Inner {
     Ok(Some(selection_ranges))
   }
 
+  #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
   async fn semantic_tokens_full(
     &self,
     params: SemanticTokensParams,
+    token: &CancellationToken,
   ) -> LspResult<Option<SemanticTokensResult>> {
     let specifier = self
       .url_map
@@ -2784,11 +3168,23 @@ impl Inner {
         specifier,
         0..line_index.text_content_length_utf16().into(),
         asset_or_doc.scope().cloned(),
+        token,
       )
-      .await?;
+      .await
+      .map_err(|err| {
+        if token.is_cancelled() {
+          LspError::request_cancelled()
+        } else {
+          lsp_warn!(
+            "Unable to get semantic classifications from TypeScript: {:#}",
+            err
+          );
+          LspError::invalid_request()
+        }
+      })?;
 
     let semantic_tokens =
-      semantic_classification.to_semantic_tokens(line_index)?;
+      semantic_classification.to_semantic_tokens(line_index, token)?;
 
     if let Some(doc) = asset_or_doc.document() {
       doc.cache_semantic_tokens_full(semantic_tokens.clone());
@@ -2803,9 +3199,11 @@ impl Inner {
     Ok(response)
   }
 
+  #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
   async fn semantic_tokens_range(
     &self,
     params: SemanticTokensRangeParams,
+    token: &CancellationToken,
   ) -> LspResult<Option<SemanticTokensRangeResult>> {
     let specifier = self
       .url_map
@@ -2840,11 +3238,23 @@ impl Inner {
         line_index.offset_tsc(params.range.start)?
           ..line_index.offset_tsc(params.range.end)?,
         asset_or_doc.scope().cloned(),
+        token,
       )
-      .await?;
+      .await
+      .map_err(|err| {
+        if token.is_cancelled() {
+          LspError::request_cancelled()
+        } else {
+          lsp_warn!(
+            "Unable to get semantic classifications from TypeScript: {:#}",
+            err
+          );
+          LspError::invalid_request()
+        }
+      })?;
 
     let semantic_tokens =
-      semantic_classification.to_semantic_tokens(line_index)?;
+      semantic_classification.to_semantic_tokens(line_index, token)?;
     let response = if !semantic_tokens.data.is_empty() {
       Some(SemanticTokensRangeResult::Tokens(semantic_tokens))
     } else {
@@ -2854,9 +3264,11 @@ impl Inner {
     Ok(response)
   }
 
+  #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
   async fn signature_help(
     &self,
     params: SignatureHelpParams,
+    token: &CancellationToken,
   ) -> LspResult<Option<SignatureHelp>> {
     let specifier = self.url_map.uri_to_specifier(
       &params.text_document_position_params.text_document.uri,
@@ -2893,11 +3305,32 @@ impl Inner {
         line_index.offset_tsc(params.text_document_position_params.position)?,
         options,
         asset_or_doc.scope().cloned(),
+        token,
       )
-      .await?;
+      .await
+      .map_err(|err| {
+        if token.is_cancelled() {
+          LspError::request_cancelled()
+        } else {
+          lsp_warn!(
+            "Unable to get signature help items from TypeScript: {:#}",
+            err
+          );
+          LspError::invalid_request()
+        }
+      })?;
 
     if let Some(signature_help_items) = maybe_signature_help_items {
-      let signature_help = signature_help_items.into_signature_help(self);
+      let signature_help = signature_help_items
+        .into_signature_help(self, token)
+        .map_err(|err| {
+          if token.is_cancelled() {
+            LspError::request_cancelled()
+          } else {
+            lsp_warn!("Unable to convert signature help items: {:#}", err);
+            LspError::internal_error()
+          }
+        })?;
       self.performance.measure(mark);
       Ok(Some(signature_help))
     } else {
@@ -2906,9 +3339,11 @@ impl Inner {
     }
   }
 
+  #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
   async fn will_rename_files(
     &self,
     params: RenameFilesParams,
+    token: &CancellationToken,
   ) -> LspResult<Option<WorkspaceEdit>> {
     let mut changes = vec![];
     for rename in params.files {
@@ -2947,20 +3382,30 @@ impl Inner {
               allow_text_changes_in_new_files: Some(true),
               ..Default::default()
             },
+            token,
           )
           .await
           .map_err(|err| {
-            lsp_warn!("{:#}", err);
-            LspError::internal_error()
+            if token.is_cancelled() {
+              LspError::request_cancelled()
+            } else {
+              lsp_warn!(
+                "Unable to get edits for file rename from TypeScript: {:#}",
+                err
+              );
+              LspError::internal_error()
+            }
           })?,
       );
     }
-    file_text_changes_to_workspace_edit(&changes, self)
+    file_text_changes_to_workspace_edit(&changes, self, token)
   }
 
+  #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
   async fn symbol(
     &self,
     params: WorkspaceSymbolParams,
+    token: &CancellationToken,
   ) -> LspResult<Option<Vec<SymbolInformation>>> {
     let mark = self.performance.mark_with_args("lsp.symbol", &params);
 
@@ -2974,11 +3419,19 @@ impl Inner {
           max_result_count: Some(256),
           file: None,
         },
+        token,
       )
       .await
       .map_err(|err| {
-        error!("{:#}", err);
-        LspError::invalid_request()
+        if token.is_cancelled() {
+          LspError::request_cancelled()
+        } else {
+          lsp_warn!(
+            "Unable to get signature help items from TypeScript: {:#}",
+            err
+          );
+          LspError::invalid_request()
+        }
       })?;
 
     let maybe_symbol_information = if navigate_to_items.is_empty() {
@@ -2986,6 +3439,9 @@ impl Inner {
     } else {
       let mut symbol_information = Vec::new();
       for item in navigate_to_items {
+        if token.is_cancelled() {
+          return Err(LspError::request_cancelled());
+        }
         if let Some(info) = item.to_symbol_information(self) {
           symbol_information.push(info);
         }
@@ -2996,6 +3452,8 @@ impl Inner {
     self.performance.measure(mark);
     Ok(maybe_symbol_information)
   }
+
+  #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
 
   fn project_changed<'a>(
     &mut self,
@@ -3018,6 +3476,7 @@ impl Inner {
     );
   }
 
+  #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
   fn send_diagnostics_update(&self) {
     let snapshot = DiagnosticServerUpdateMessage {
       snapshot: self.snapshot(),
@@ -3039,11 +3498,12 @@ impl Inner {
   }
 }
 
-#[tower_lsp::async_trait]
+#[tower_lsp::async_trait(?Send)]
 impl tower_lsp::LanguageServer for LanguageServer {
   async fn execute_command(
     &self,
     params: ExecuteCommandParams,
+    _token: CancellationToken,
   ) -> LspResult<Option<Value>> {
     if !self.init_flag.is_raised() {
       self.init_flag.wait_raised().await;
@@ -3140,7 +3600,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
     if !self.init_flag.is_raised() {
       self.init_flag.wait_raised().await;
     }
-    self.inner.write().await.did_change(params).await
+    self.inner.write().await.did_change(params).await;
   }
 
   async fn did_save(&self, params: DidSaveTextDocumentParams) {
@@ -3154,7 +3614,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
     if !self.init_flag.is_raised() {
       self.init_flag.wait_raised().await;
     }
-    self.inner.write().await.did_close(params).await
+    self.inner.write().await.did_close(params).await;
   }
 
   async fn did_change_configuration(
@@ -3189,7 +3649,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
       .write()
       .await
       .did_change_watched_files(params)
-      .await
+      .await;
   }
 
   async fn did_change_workspace_folders(
@@ -3220,255 +3680,352 @@ impl tower_lsp::LanguageServer for LanguageServer {
   async fn document_symbol(
     &self,
     params: DocumentSymbolParams,
+    token: CancellationToken,
   ) -> LspResult<Option<DocumentSymbolResponse>> {
     if !self.init_flag.is_raised() {
       self.init_flag.wait_raised().await;
     }
-    self.inner.read().await.document_symbol(params).await
+    self
+      .inner
+      .read()
+      .await
+      .document_symbol(params, &token)
+      .await
   }
 
   async fn formatting(
     &self,
     params: DocumentFormattingParams,
+    token: CancellationToken,
   ) -> LspResult<Option<Vec<TextEdit>>> {
     if !self.init_flag.is_raised() {
       self.init_flag.wait_raised().await;
     }
-    self.inner.read().await.formatting(params).await
+    self.inner.read().await.formatting(params, &token).await
   }
 
-  async fn hover(&self, params: HoverParams) -> LspResult<Option<Hover>> {
+  async fn hover(
+    &self,
+    params: HoverParams,
+    token: CancellationToken,
+  ) -> LspResult<Option<Hover>> {
     if !self.init_flag.is_raised() {
       self.init_flag.wait_raised().await;
     }
-    self.inner.read().await.hover(params).await
+    self.inner.read().await.hover(params, &token).await
   }
 
   async fn inlay_hint(
     &self,
     params: InlayHintParams,
+    token: CancellationToken,
   ) -> LspResult<Option<Vec<InlayHint>>> {
     if !self.init_flag.is_raised() {
       self.init_flag.wait_raised().await;
     }
-    self.inner.read().await.inlay_hint(params).await
+    self.inner.read().await.inlay_hint(params, &token).await
   }
 
   async fn code_action(
     &self,
     params: CodeActionParams,
+    token: CancellationToken,
   ) -> LspResult<Option<CodeActionResponse>> {
     if !self.init_flag.is_raised() {
       self.init_flag.wait_raised().await;
     }
-    self.inner.read().await.code_action(params).await
+    self.inner.read().await.code_action(params, &token).await
   }
 
   async fn code_action_resolve(
     &self,
     params: CodeAction,
+    token: CancellationToken,
   ) -> LspResult<CodeAction> {
     if !self.init_flag.is_raised() {
       self.init_flag.wait_raised().await;
     }
-    self.inner.read().await.code_action_resolve(params).await
+    self
+      .inner
+      .read()
+      .await
+      .code_action_resolve(params, &token)
+      .await
   }
 
   async fn code_lens(
     &self,
     params: CodeLensParams,
+    token: CancellationToken,
   ) -> LspResult<Option<Vec<CodeLens>>> {
     if !self.init_flag.is_raised() {
       self.init_flag.wait_raised().await;
     }
-    self.inner.read().await.code_lens(params).await
+    self.inner.read().await.code_lens(params, &token).await
   }
 
-  async fn code_lens_resolve(&self, params: CodeLens) -> LspResult<CodeLens> {
+  async fn code_lens_resolve(
+    &self,
+    params: CodeLens,
+    token: CancellationToken,
+  ) -> LspResult<CodeLens> {
     if !self.init_flag.is_raised() {
       self.init_flag.wait_raised().await;
     }
-    self.inner.read().await.code_lens_resolve(params).await
+    self
+      .inner
+      .read()
+      .await
+      .code_lens_resolve(params, &token)
+      .await
   }
 
   async fn document_highlight(
     &self,
     params: DocumentHighlightParams,
+    token: CancellationToken,
   ) -> LspResult<Option<Vec<DocumentHighlight>>> {
     if !self.init_flag.is_raised() {
       self.init_flag.wait_raised().await;
     }
-    self.inner.read().await.document_highlight(params).await
+    self
+      .inner
+      .read()
+      .await
+      .document_highlight(params, &token)
+      .await
   }
 
   async fn references(
     &self,
     params: ReferenceParams,
+    token: CancellationToken,
   ) -> LspResult<Option<Vec<Location>>> {
     if !self.init_flag.is_raised() {
       self.init_flag.wait_raised().await;
     }
-    self.inner.read().await.references(params).await
+    self.inner.read().await.references(params, &token).await
   }
 
   async fn goto_definition(
     &self,
     params: GotoDefinitionParams,
+    token: CancellationToken,
   ) -> LspResult<Option<GotoDefinitionResponse>> {
     if !self.init_flag.is_raised() {
       self.init_flag.wait_raised().await;
     }
-    self.inner.read().await.goto_definition(params).await
+    self
+      .inner
+      .read()
+      .await
+      .goto_definition(params, &token)
+      .await
   }
 
   async fn goto_type_definition(
     &self,
     params: GotoTypeDefinitionParams,
+    token: CancellationToken,
   ) -> LspResult<Option<GotoTypeDefinitionResponse>> {
     if !self.init_flag.is_raised() {
       self.init_flag.wait_raised().await;
     }
-    self.inner.read().await.goto_type_definition(params).await
+    self
+      .inner
+      .read()
+      .await
+      .goto_type_definition(params, &token)
+      .await
   }
 
   async fn completion(
     &self,
     params: CompletionParams,
+    token: CancellationToken,
   ) -> LspResult<Option<CompletionResponse>> {
     if !self.init_flag.is_raised() {
       self.init_flag.wait_raised().await;
     }
-    self.inner.read().await.completion(params).await
+    self.inner.read().await.completion(params, &token).await
   }
 
   async fn completion_resolve(
     &self,
     params: CompletionItem,
+    token: CancellationToken,
   ) -> LspResult<CompletionItem> {
     if !self.init_flag.is_raised() {
       self.init_flag.wait_raised().await;
     }
-    self.inner.read().await.completion_resolve(params).await
+    self
+      .inner
+      .read()
+      .await
+      .completion_resolve(params, &token)
+      .await
   }
 
   async fn goto_implementation(
     &self,
     params: GotoImplementationParams,
+    token: CancellationToken,
   ) -> LspResult<Option<GotoImplementationResponse>> {
     if !self.init_flag.is_raised() {
       self.init_flag.wait_raised().await;
     }
-    self.inner.read().await.goto_implementation(params).await
+    self
+      .inner
+      .read()
+      .await
+      .goto_implementation(params, &token)
+      .await
   }
 
   async fn folding_range(
     &self,
     params: FoldingRangeParams,
+    token: CancellationToken,
   ) -> LspResult<Option<Vec<FoldingRange>>> {
     if !self.init_flag.is_raised() {
       self.init_flag.wait_raised().await;
     }
-    self.inner.read().await.folding_range(params).await
+    self.inner.read().await.folding_range(params, &token).await
   }
 
   async fn incoming_calls(
     &self,
     params: CallHierarchyIncomingCallsParams,
+    token: CancellationToken,
   ) -> LspResult<Option<Vec<CallHierarchyIncomingCall>>> {
     if !self.init_flag.is_raised() {
       self.init_flag.wait_raised().await;
     }
-    self.inner.read().await.incoming_calls(params).await
+    self.inner.read().await.incoming_calls(params, &token).await
   }
 
   async fn outgoing_calls(
     &self,
     params: CallHierarchyOutgoingCallsParams,
+    token: CancellationToken,
   ) -> LspResult<Option<Vec<CallHierarchyOutgoingCall>>> {
     if !self.init_flag.is_raised() {
       self.init_flag.wait_raised().await;
     }
-    self.inner.read().await.outgoing_calls(params).await
+    self.inner.read().await.outgoing_calls(params, &token).await
   }
 
   async fn prepare_call_hierarchy(
     &self,
     params: CallHierarchyPrepareParams,
+    token: CancellationToken,
   ) -> LspResult<Option<Vec<CallHierarchyItem>>> {
     if !self.init_flag.is_raised() {
       self.init_flag.wait_raised().await;
     }
-    self.inner.read().await.prepare_call_hierarchy(params).await
+    self
+      .inner
+      .read()
+      .await
+      .prepare_call_hierarchy(params, &token)
+      .await
   }
 
   async fn rename(
     &self,
     params: RenameParams,
+    token: CancellationToken,
   ) -> LspResult<Option<WorkspaceEdit>> {
     if !self.init_flag.is_raised() {
       self.init_flag.wait_raised().await;
     }
-    self.inner.read().await.rename(params).await
+    self.inner.read().await.rename(params, &token).await
   }
 
   async fn selection_range(
     &self,
     params: SelectionRangeParams,
+    token: CancellationToken,
   ) -> LspResult<Option<Vec<SelectionRange>>> {
     if !self.init_flag.is_raised() {
       self.init_flag.wait_raised().await;
     }
-    self.inner.read().await.selection_range(params).await
+    self
+      .inner
+      .read()
+      .await
+      .selection_range(params, &token)
+      .await
   }
 
   async fn semantic_tokens_full(
     &self,
     params: SemanticTokensParams,
+    token: CancellationToken,
   ) -> LspResult<Option<SemanticTokensResult>> {
     if !self.init_flag.is_raised() {
       self.init_flag.wait_raised().await;
     }
-    self.inner.read().await.semantic_tokens_full(params).await
+    self
+      .inner
+      .read()
+      .await
+      .semantic_tokens_full(params, &token)
+      .await
   }
 
   async fn semantic_tokens_range(
     &self,
     params: SemanticTokensRangeParams,
+    token: CancellationToken,
   ) -> LspResult<Option<SemanticTokensRangeResult>> {
     if !self.init_flag.is_raised() {
       self.init_flag.wait_raised().await;
     }
-    self.inner.read().await.semantic_tokens_range(params).await
+    self
+      .inner
+      .read()
+      .await
+      .semantic_tokens_range(params, &token)
+      .await
   }
 
   async fn signature_help(
     &self,
     params: SignatureHelpParams,
+    token: CancellationToken,
   ) -> LspResult<Option<SignatureHelp>> {
     if !self.init_flag.is_raised() {
       self.init_flag.wait_raised().await;
     }
-    self.inner.read().await.signature_help(params).await
+    self.inner.read().await.signature_help(params, &token).await
   }
 
   async fn will_rename_files(
     &self,
     params: RenameFilesParams,
+    token: CancellationToken,
   ) -> LspResult<Option<WorkspaceEdit>> {
     if !self.init_flag.is_raised() {
       self.init_flag.wait_raised().await;
     }
-    self.inner.read().await.will_rename_files(params).await
+    self
+      .inner
+      .read()
+      .await
+      .will_rename_files(params, &token)
+      .await
   }
 
   async fn symbol(
     &self,
     params: WorkspaceSymbolParams,
+    token: CancellationToken,
   ) -> LspResult<Option<Vec<SymbolInformation>>> {
     if !self.init_flag.is_raised() {
       self.init_flag.wait_raised().await;
     }
-    self.inner.read().await.symbol(params).await
+    self.inner.read().await.symbol(params, &token).await
   }
 }
 
@@ -3572,6 +4129,8 @@ impl Inner {
     registrations
   }
 
+  #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
+
   fn prepare_cache(
     &mut self,
     specifiers: Vec<ModuleSpecifier>,
@@ -3650,6 +4209,7 @@ impl Inner {
     })
   }
 
+  #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
   async fn post_cache(&mut self) {
     self.resolver.did_cache();
     self.refresh_dep_info().await;
@@ -3659,6 +4219,8 @@ impl Inner {
     self.send_diagnostics_update();
     self.send_testing_update();
   }
+
+  #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
 
   fn pre_did_change_workspace_folders(
     &mut self,
@@ -3688,6 +4250,7 @@ impl Inner {
     self.config.set_workspace_folders(workspace_folders);
   }
 
+  #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
   async fn post_did_change_workspace_folders(&mut self) {
     self.refresh_workspace_files();
     self.refresh_config_tree().await;
@@ -3767,9 +4330,11 @@ impl Inner {
     Ok(result)
   }
 
+  #[cfg_attr(feature = "lsp-tracing", tracing::instrument(skip_all))]
   async fn inlay_hint(
     &self,
     params: InlayHintParams,
+    token: &CancellationToken,
   ) -> LspResult<Option<Vec<InlayHint>>> {
     let specifier = self
       .url_map
@@ -3802,14 +4367,30 @@ impl Inner {
           &specifier,
         ),
         asset_or_doc.scope().cloned(),
+        token,
       )
-      .await?;
-    let maybe_inlay_hints = maybe_inlay_hints.map(|hints| {
-      hints
-        .iter()
-        .map(|hint| hint.to_lsp(line_index.clone(), self))
-        .collect()
-    });
+      .await
+      .map_err(|err| {
+        if token.is_cancelled() {
+          LspError::request_cancelled()
+        } else {
+          error!("Unable to get inlay hints from TypeScript: {:#}", err);
+          LspError::internal_error()
+        }
+      })?;
+    let maybe_inlay_hints = maybe_inlay_hints
+      .map(|hints| {
+        hints
+          .into_iter()
+          .map(|hint| {
+            if token.is_cancelled() {
+              return Err(LspError::request_cancelled());
+            }
+            Ok(hint.to_lsp(line_index.clone(), self))
+          })
+          .collect()
+      })
+      .transpose()?;
     self.performance.measure(mark);
     Ok(maybe_inlay_hints)
   }
